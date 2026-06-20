@@ -138,7 +138,7 @@ fn build_squash() -> Vec<i32> {
 // Predictor: portfolio of models + logistic mixer (integer fixed-point).
 // ---------------------------------------------------------------------------
 
-const MEM_BITS: usize = 22;
+const MEM_BITS: usize = 20;
 const MASK: usize = (1 << MEM_BITS) - 1;
 const NORD: usize = 5;
 const NSTR: usize = 2;
@@ -187,7 +187,7 @@ struct NumState {
 
 struct Predictor {
     buf: Vec<u8>,
-    t: Vec<Vec<u16>>,
+    t: Vec<u16>, // NTAB context tables, flattened: model m occupies [m<<MEM_BITS ..]
     mm: Vec<u32>,
     stretch_tab: Vec<i32>,
     squash_tab: Vec<i32>,
@@ -236,7 +236,7 @@ impl Predictor {
         let init_w = (1i32 << 16) / NIN as i32;
         let mut p = Self {
             buf: Vec::new(),
-            t: vec![vec![2048u16; 1 << MEM_BITS]; NTAB],
+            t: vec![2048u16; NTAB << MEM_BITS],
             mm: vec![0u32; 1 << MEM_BITS],
             stretch_tab: build_stretch(),
             squash_tab: build_squash(),
@@ -311,10 +311,12 @@ impl Predictor {
     #[inline]
     fn predict(&mut self) -> u32 {
         for m in 0..NTAB {
-            let idx = (self.ctxh[m] ^ self.c0.wrapping_mul(2_654_435_761)) as usize & MASK;
-            self.idx[m] = idx;
-            let tv = (self.t[m][idx] as usize).min(4095);
-            self.st[m] = self.stretch_tab[tv];
+            let local = (self.ctxh[m] ^ self.c0.wrapping_mul(2_654_435_761)) as usize & MASK;
+            let flat = (m << MEM_BITS) | local; // local < 2^MEM_BITS, so this is m*stride+local
+            self.idx[m] = flat;
+            // SAFETY: flat < NTAB<<MEM_BITS = t.len(); tv < 4096 = stretch_tab.len()
+            let tv = unsafe { *self.t.get_unchecked(flat) } as usize;
+            self.st[m] = unsafe { *self.stretch_tab.get_unchecked(tv & 4095) };
         }
         // match model: ± precomputed confidence depending on the predicted bit
         let mut sm = 0;
@@ -340,13 +342,14 @@ impl Predictor {
 
         // mix: dot product in 16.16 fixed-point
         self.wsel = *self.buf.last().unwrap_or(&0) as usize;
-        let w = &self.w[self.wsel];
+        // SAFETY: wsel < 256 = w.len(); (d+2048) in [1,4095] < squash_tab.len()
+        let w = unsafe { self.w.get_unchecked(self.wsel) };
         let mut dot: i64 = 0;
         for i in 0..NIN {
             dot += w[i] as i64 * self.st[i] as i64;
         }
         let d = ((dot >> 16) as i32).clamp(ST_MIN, ST_MAX);
-        self.pr = self.squash_tab[(d + 2048) as usize].clamp(1, 4095);
+        self.pr = unsafe { *self.squash_tab.get_unchecked((d + 2048) as usize) }.clamp(1, 4095);
         self.pr as u32
     }
 
@@ -354,14 +357,15 @@ impl Predictor {
     fn update(&mut self, bit: u32) {
         // mixer weight update (integer gradient step)
         let err = (((bit as i32) << 12) - self.pr) * LR;
-        let w = &mut self.w[self.wsel];
+        // SAFETY: wsel < 256; each idx[m] = (m<<MEM_BITS)|local < t.len()
+        let w = unsafe { self.w.get_unchecked_mut(self.wsel) };
         for i in 0..NIN {
             w[i] += (self.st[i] * err) >> 16;
         }
         // context table updates
         let target = (bit * 4096) as i32;
         for m in 0..NTAB {
-            let cell = &mut self.t[m][self.idx[m]];
+            let cell = unsafe { self.t.get_unchecked_mut(self.idx[m]) };
             let cur = *cell as i32;
             *cell = (cur + ((target - cur) >> RATE)) as u16;
         }

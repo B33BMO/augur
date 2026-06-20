@@ -135,11 +135,19 @@ the mixer in i32/i64, and the match/numeric confidences precomputed at byte
 boundaries (they only change there) instead of per bit. No transcendental calls in
 the hot path.
 
-The expected payoff was speed (3–5x; now 2.6–4.6 MB/s encode — competitive with
-`xz -9e`). The *unexpected* payoff: ratios went **up** across the board, because the
-integer mixer (lpaq-style weight initialization and learning rate) converges better
-than my hand-tuned float version. The same change made it both faster and tighter —
-and it erased an earlier ~3% regression the numeric model had on float-heavy data.
+The expected payoff was speed (now ~5 MB/s encode — faster than `xz -9e`). The
+*unexpected* payoff: ratios went **up** across the board, because the integer mixer
+(lpaq-style weight initialization and learning rate) converges better than my
+hand-tuned float version. The same change made it both faster and tighter — and it
+erased an earlier ~3% regression the numeric model had on float-heavy data.
+
+Then decode. Context-mixing decode is the slow side: it's *symmetric* (runs the same
+model) and *serial* (each bit must be decoded before the next can be predicted, so
+nothing pipelines). Profiling pointed at memory — seven random lookups per bit into
+56 MB of context tables, mostly cache misses. Two fixes: flatten the tables into one
+contiguous buffer (no pointer-chasing, no bounds checks on the hot path) and shrink
+them to fit cache. Decode got **20–40% faster** for ~2–3% ratio. Encode 4.6–5.5 MB/s,
+decode 3.4–4.1 MB/s now.
 
 ## Results
 
@@ -148,33 +156,35 @@ augur vs the best general-purpose compressors, full files, compression ratio
 
 | dataset | old Recursor | zstd-19 | xz-9e | parquet+zstd | **augur** |
 |---|---|---|---|---|---|
-| gh_events.ndjson | 5.90x | 16.84x | 19.89x | — | **22.35x** |
-| nginx_logs | 14.65x | 26.54x | 29.32x | 28.29x | **41.79x** |
-| taxi.csv | 5.45x | 8.12x | 8.45x | 6.18x | **9.38x** |
-| taxi.ndjson | 26.12x | 27.98x | 31.84x | 33.50x | **40.70x** |
+| gh_events.ndjson | 5.90x | 16.84x | 19.89x | — | **21.67x** |
+| nginx_logs | 14.65x | 26.54x | 29.32x | 28.29x | **41.52x** |
+| taxi.csv | 5.45x | 8.12x | 8.45x | 6.18x | **9.32x** |
+| taxi.ndjson | 26.12x | 27.98x | 31.84x | 33.50x | **40.53x** |
 | seq.ndjson (synthetic) | — | 11.37x | 15.19x | — | **32.44x** |
-| threats.ndjson (real) | — | 11.71x | 12.76x | — | **16.22x** |
+| threats.ndjson (real) | — | 11.71x | 12.76x | — | **15.96x** |
 
-augur beats `xz -9e` on **every dataset tested — six for six** — by 11% to 114% —
+augur beats `xz -9e` on **every dataset tested — six for six** — by 9% to 114% —
 and beats `parquet+zstd`, the columnar specialist, on every tabular case where it
 applies. Every output is **byte-exact lossless** (verified roundtrip on every run).
 
 ## The honest caveat
 
-**Encode speed is now competitive; decode is the real gap.** augur encodes at
-2.6–4.6 MB/s — in the same range as `xz -9e`, sometimes faster. But context mixing is
-*symmetric*: decode runs the identical model, so it's also ~3 MB/s, while zstd and xz
-decode at hundreds of MB/s to GB/s. For write-once / read-rarely data (archival,
-cold feeds, backups) that's fine; for hot read paths it isn't yet. Closing it means a
-cheaper model on the decode side — a real research problem, not a free lunch. Named,
-not hidden.
+**Encode beats xz on speed too; decode is the real gap.** augur encodes at
+4.6–5.5 MB/s — faster than `xz -9e`. Decode is 3.4–4.1 MB/s, while zstd and xz decode
+at hundreds of MB/s to GB/s. That gap is structural: context-mixing decode is
+symmetric and serial (each bit must be decoded before the next prediction), so it
+can't pipeline like encode. For write-once / read-rarely data (archival, cold feeds,
+backups) it's already fine; for hot read paths, closing it means a fundamentally
+cheaper decode-side model — a real research problem, not a free lunch. Named, not
+hidden.
 
 ## What's next
 
-- **Decode speed:** cache-friendlier table layout, faster per-byte hashing, and
-  exploring an asymmetric fast-decode mode.
-- **Widen the moat:** CSV column-awareness, a code-aware model, and richer formula
-  detection (multi-column dependencies, non-linear sequences).
+- **Widen the moat:** CSV column-awareness (taxi.csv is the weakest — the JSON parser
+  doesn't engage there), a code-aware model, and richer formula detection
+  (multi-column dependencies, non-linear sequences).
+- **Ship it:** a real `compress`/`decompress` file CLI with a container header, a
+  README, and a public repo.
 - **The deep end:** the same "predict the next thing, code the surprise" socket is
   exactly how modern neural video codecs work. Video is where this thesis goes to
   become spectacular — once we've earned it on lossless structured data.
