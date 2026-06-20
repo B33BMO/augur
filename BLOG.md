@@ -84,7 +84,12 @@ exposes a semantic context: *which field's value am I currently inside?* Predict
 condition on `(field, position)` and `(field, depth)` — so the value bytes of
 `created_at` are modeled separately from those of `id` or `url`.
 
-That single idea pushed gh_events from **18.44x → 20.34x — past xz.**
+That single idea pushed gh_events from **18.44x → 20.34x — past xz.** The same trick
+generalizes by format: a one-byte header records whether the data is JSON, CSV, or
+generic (sniffed at compress time, read back at decompress, so the parsers never
+collide). The CSV parser exposes the *column index* as the semantic context and
+routes the numeric model per-column — which lifted taxi.csv from 9.32x to **11.11x**,
++31% over xz, because columnar numeric data is exactly what byte-LZ handles worst.
 
 Then the categorically-new weapon: a **numeric model** — formula detection in its
 most common form. For each field it tracks the last value and its delta, and when
@@ -157,8 +162,8 @@ augur vs the best general-purpose compressors, full files, compression ratio
 | dataset | old Recursor | zstd-19 | xz-9e | parquet+zstd | **augur** |
 |---|---|---|---|---|---|
 | gh_events.ndjson | 5.90x | 16.84x | 19.89x | — | **21.67x** |
-| nginx_logs | 14.65x | 26.54x | 29.32x | 28.29x | **41.52x** |
-| taxi.csv | 5.45x | 8.12x | 8.45x | 6.18x | **9.32x** |
+| nginx_logs | 14.65x | 26.54x | 29.32x | 28.29x | **41.79x** |
+| taxi.csv | 5.45x | 8.12x | 8.45x | 6.18x | **11.11x** |
 | taxi.ndjson | 26.12x | 27.98x | 31.84x | 33.50x | **40.53x** |
 | seq.ndjson (synthetic) | — | 11.37x | 15.19x | — | **32.44x** |
 | threats.ndjson (real) | — | 11.71x | 12.76x | — | **15.96x** |
@@ -180,10 +185,9 @@ hidden.
 
 ## What's next
 
-- **Widen the moat:** CSV column-awareness (taxi.csv is the weakest — the JSON parser
-  doesn't engage there), a code-aware model, and richer formula detection
+- **Widen the moat further:** a code-aware model, and richer formula detection
   (multi-column dependencies, non-linear sequences).
-- **Ship it:** a real `compress`/`decompress` file CLI with a container header, a
+- **Ship it:** a real `compress`/`decompress` file CLI with a full container header, a
   README, and a public repo.
 - **The deep end:** the same "predict the next thing, code the surprise" socket is
   exactly how modern neural video codecs work. Video is where this thesis goes to

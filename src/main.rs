@@ -150,6 +150,62 @@ const LR: i32 = 7; // mixer learning rate (lpaq-style)
 const ARRAY_TAG: u32 = 0xA22A_5151;
 const NUMSLOTS: usize = 1 << 16;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Generic,
+    Json,
+    Csv,
+}
+
+impl Mode {
+    fn to_byte(self) -> u8 {
+        match self {
+            Mode::Generic => 0,
+            Mode::Json => 1,
+            Mode::Csv => 2,
+        }
+    }
+    fn from_byte(b: u8) -> Mode {
+        match b {
+            1 => Mode::Json,
+            2 => Mode::Csv,
+            _ => Mode::Generic,
+        }
+    }
+}
+
+/// Sniff the data format from a prefix. The result is stored in the container
+/// header so the decoder configures the same parser — the JSON and CSV models
+/// never run at once and so never interfere.
+fn sniff(data: &[u8]) -> Mode {
+    let sample = &data[..data.len().min(65536)];
+    let first = sample.iter().copied().find(|b| !b.is_ascii_whitespace());
+    let mut lines = 1usize;
+    let mut commas = 0usize;
+    let mut braces = 0usize;
+    for &b in sample {
+        match b {
+            b'\n' => lines += 1,
+            b',' => commas += 1,
+            b'{' => braces += 1,
+            _ => {}
+        }
+    }
+    if matches!(first, Some(b'{') | Some(b'[')) && braces * 2 >= lines {
+        Mode::Json
+    } else if commas >= lines {
+        Mode::Csv
+    } else {
+        Mode::Generic
+    }
+}
+
+/// Field identity for a CSV column (kept distinct from JSON field hashes).
+#[inline]
+fn csv_field(col: u32) -> u32 {
+    col.wrapping_mul(0x9e37_79b1) ^ 0xC5C5_3737
+}
+
 #[inline]
 fn hstep(h: u32, c: u8) -> u32 {
     (h ^ c as u32).wrapping_mul(0x0100_0193)
@@ -209,6 +265,11 @@ struct Predictor {
     stack: Vec<Frame>,
     vpos: u32,
     value_pending: bool,
+    // format mode + CSV parser state
+    mode: Mode,
+    csv_col: u32,
+    csv_in_quote: bool,
+    csv_value_pending: bool,
     // numeric model
     num: Vec<NumState>,
     in_num_value: bool,
@@ -232,7 +293,7 @@ struct Predictor {
 }
 
 impl Predictor {
-    fn new() -> Self {
+    fn new(mode: Mode) -> Self {
         let init_w = (1i32 << 16) / NIN as i32;
         let mut p = Self {
             buf: Vec::new(),
@@ -255,6 +316,10 @@ impl Predictor {
             stack: Vec::with_capacity(32),
             vpos: 0,
             value_pending: false,
+            mode,
+            csv_col: 0,
+            csv_in_quote: false,
+            csv_value_pending: true,
             num: vec![NumState::default(); NUMSLOTS],
             in_num_value: false,
             cur_num: 0,
@@ -296,15 +361,19 @@ impl Predictor {
                 (k as u32).wrapping_mul(0x9e37_79b1)
             };
         }
-        let field = self.field_hash();
-        let depth = self.stack.len().min(15) as u32;
-        let in_val_str = (self.in_str && !self.str_is_key) as u32;
+        // structure context: (field identity, secondary axis) per format
         let last = *self.buf.last().unwrap_or(&0) as u32;
+        let (field, aux) = match self.mode {
+            Mode::Json => (self.field_hash(), self.stack.len().min(15) as u32),
+            Mode::Csv => (csv_field(self.csv_col), self.csv_col),
+            Mode::Generic => (0, 0),
+        };
+        let in_val_str = (self.in_str && !self.str_is_key) as u32;
         self.ctxh[NORD] = field
             ^ self.vpos.wrapping_mul(0x85eb_ca6b)
             ^ in_val_str.wrapping_mul(0xc2b2_ae35);
         self.ctxh[NORD + 1] = field.wrapping_mul(0x9e37_79b1)
-            ^ depth.wrapping_mul(0x27d4_eb2f)
+            ^ aux.wrapping_mul(0x27d4_eb2f)
             ^ last.wrapping_mul(0x1656_67b1);
     }
 
@@ -415,8 +484,12 @@ impl Predictor {
             self.match_mag = 0;
         }
 
-        // --- streaming JSON parser + numeric model ---
-        self.update_struct(byte);
+        // --- structure + numeric model (format-aware) ---
+        match self.mode {
+            Mode::Json => self.update_struct_json(byte),
+            Mode::Csv => self.update_struct_csv(byte),
+            Mode::Generic => self.update_struct_generic(byte),
+        }
 
         self.recompute_ctx();
     }
@@ -489,7 +562,7 @@ impl Predictor {
         }
     }
 
-    fn update_struct(&mut self, c: u8) {
+    fn update_struct_json(&mut self, c: u8) {
         if self.in_str {
             if self.esc {
                 self.esc = false;
@@ -619,6 +692,110 @@ impl Predictor {
             }
         }
     }
+
+    /// Generic parser for unstructured/text data: tracks position-in-token and
+    /// in-string state, which gives a cheap positional context (helps logs and
+    /// free text). No field identity.
+    fn update_struct_generic(&mut self, c: u8) {
+        if self.in_str {
+            if c == b'"' {
+                self.in_str = false;
+            }
+            self.vpos = (self.vpos + 1).min(31);
+            return;
+        }
+        match c {
+            b'"' => {
+                self.in_str = true;
+                self.vpos = 0;
+            }
+            b' ' | b'\n' | b'\r' | b'\t' => {
+                self.vpos = 0;
+            }
+            _ => {
+                self.vpos = (self.vpos + 1).min(31);
+            }
+        }
+    }
+
+    /// CSV/delimited parser: exposes the current column index as the semantic
+    /// context, and routes the numeric model per-column (so sequential/integer
+    /// columns get formula prediction just like JSON fields do).
+    fn update_struct_csv(&mut self, c: u8) {
+        if self.csv_in_quote {
+            if c == b'"' {
+                self.csv_in_quote = false;
+            }
+            self.in_num_value = false; // quoted field is not a bare number
+            self.np_active = false;
+            self.vpos = (self.vpos + 1).min(31);
+            return;
+        }
+        match c {
+            b'"' => {
+                self.csv_in_quote = true;
+                self.csv_value_pending = false;
+                self.in_num_value = false;
+                self.np_active = false;
+                self.vpos = 0;
+            }
+            b',' | b'\n' => {
+                if self.in_num_value {
+                    self.finalize_numeric();
+                    self.in_num_value = false;
+                }
+                self.np_active = false;
+                if c == b'\n' {
+                    self.csv_col = 0;
+                } else {
+                    self.csv_col += 1;
+                }
+                let f = csv_field(self.csv_col);
+                self.set_np(f); // set up prediction for the next column's value
+                self.csv_value_pending = true;
+                self.vpos = 0;
+            }
+            _ => {
+                if self.csv_value_pending {
+                    self.csv_value_pending = false;
+                    if c.is_ascii_digit() || c == b'-' {
+                        self.in_num_value = true;
+                        self.cur_is_num = true;
+                        self.cur_neg = c == b'-';
+                        self.cur_num = 0;
+                        self.cur_len = 0;
+                        self.cur_field = csv_field(self.csv_col);
+                        if c != b'-' {
+                            self.cur_num = (c - b'0') as i64;
+                            self.cur_len = 1;
+                        }
+                        self.np_consume(c);
+                    } else {
+                        self.in_num_value = false;
+                        self.np_active = false;
+                    }
+                } else if self.in_num_value {
+                    if c.is_ascii_digit() {
+                        if self.cur_len < 18 {
+                            self.cur_num = self.cur_num * 10 + (c - b'0') as i64;
+                            self.cur_len += 1;
+                        } else {
+                            self.cur_is_num = false;
+                        }
+                        self.np_consume(c);
+                    } else {
+                        if c == b'.' || c == b'e' || c == b'E' {
+                            self.cur_is_num = false;
+                        }
+                        self.finalize_numeric();
+                        self.in_num_value = false;
+                        self.np_active = false;
+                    }
+                }
+                self.vpos = (self.vpos + 1).min(31);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -626,7 +803,8 @@ impl Predictor {
 // ---------------------------------------------------------------------------
 
 fn compress(data: &[u8]) -> Vec<u8> {
-    let mut pr = Predictor::new();
+    let mode = sniff(data);
+    let mut pr = Predictor::new(mode);
     let mut enc = Encoder::new();
     for &byte in data {
         for i in (0..8).rev() {
@@ -636,12 +814,17 @@ fn compress(data: &[u8]) -> Vec<u8> {
             pr.update(bit);
         }
     }
-    enc.finish()
+    let stream = enc.finish();
+    let mut out = Vec::with_capacity(stream.len() + 1);
+    out.push(mode.to_byte()); // container header: format mode
+    out.extend_from_slice(&stream);
+    out
 }
 
 fn decompress(comp: &[u8], orig_len: usize) -> Vec<u8> {
-    let mut pr = Predictor::new();
-    let mut dec = Decoder::new(comp);
+    let mode = Mode::from_byte(comp[0]);
+    let mut pr = Predictor::new(mode);
+    let mut dec = Decoder::new(&comp[1..]);
     let mut out = Vec::with_capacity(orig_len);
     for _ in 0..orig_len {
         let mut byte = 0u8;
