@@ -1,0 +1,19 @@
+[package]
+name = "augur"
+version = "0.1.0"
+edition = "2021"
+
+# augur — "predict, don't pack". A from-scratch context-mixing compressor.
+# Thesis: compression == prediction. One binary arithmetic coder fed by a
+# logistic mixture of predictors (context models + match model). The novel
+# work (structure/program detection) plugs into the same predictor socket later.
+
+[[bin]]
+name = "augur"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
