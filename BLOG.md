@@ -127,6 +127,20 @@ timestamps; and — the honesty check — it correctly *ignored* the random cuid
 field, where there's no sequence to find. Extrapolated to the full 7.8M threats,
 that's a multi-gigabyte feed compressing losslessly to roughly **1/14th** its size.
 
+## Step 6: making it fast — and, surprisingly, better
+
+The prototype was ~1 MB/s: it did a floating-point `exp`/`ln` per bit per model. I
+rewrote the inner loop in integer fixed-point — `stretch`/`squash` as lookup tables,
+the mixer in i32/i64, and the match/numeric confidences precomputed at byte
+boundaries (they only change there) instead of per bit. No transcendental calls in
+the hot path.
+
+The expected payoff was speed (3–5x; now 2.6–4.6 MB/s encode — competitive with
+`xz -9e`). The *unexpected* payoff: ratios went **up** across the board, because the
+integer mixer (lpaq-style weight initialization and learning rate) converges better
+than my hand-tuned float version. The same change made it both faster and tighter —
+and it erased an earlier ~3% regression the numeric model had on float-heavy data.
+
 ## Results
 
 augur vs the best general-purpose compressors, full files, compression ratio
@@ -134,35 +148,31 @@ augur vs the best general-purpose compressors, full files, compression ratio
 
 | dataset | old Recursor | zstd-19 | xz-9e | parquet+zstd | **augur** |
 |---|---|---|---|---|---|
-| gh_events.ndjson | 5.90x | 16.84x | 19.89x | — | **20.34x** |
-| nginx_logs | 14.65x | 26.54x | 29.32x | 28.29x | **37.95x** |
-| taxi.csv | 5.45x | 8.12x | 8.45x | 6.18x | **8.82x** |
-| taxi.ndjson | 26.12x | 27.98x | 31.84x | 33.50x | **38.72x** |
-| seq.ndjson (synthetic) | — | 11.37x | 15.19x | — | **29.21x** |
-| threats.ndjson (real) | — | 11.71x | 12.76x | — | **14.39x** |
+| gh_events.ndjson | 5.90x | 16.84x | 19.89x | — | **22.35x** |
+| nginx_logs | 14.65x | 26.54x | 29.32x | 28.29x | **41.79x** |
+| taxi.csv | 5.45x | 8.12x | 8.45x | 6.18x | **9.38x** |
+| taxi.ndjson | 26.12x | 27.98x | 31.84x | 33.50x | **40.70x** |
+| seq.ndjson (synthetic) | — | 11.37x | 15.19x | — | **32.44x** |
+| threats.ndjson (real) | — | 11.71x | 12.76x | — | **16.22x** |
 
-augur beats `xz -9e` on **every dataset tested — six for six** — and beats
-`parquet+zstd`, the columnar specialist, on every tabular case where it applies.
-Every output is **byte-exact lossless** (verified roundtrip on every run).
-
-One honest note: the numeric model is a big win where fields are sequential
-(synthetic +92% over xz, threats +13%) and a small (~3%) cost on float-heavy data
-like taxi, where it carries an input the mixer rarely needs. Net positive, and even
-there augur stays far ahead of the field. No silent trade-offs — the regression is
-named, not hidden.
+augur beats `xz -9e` on **every dataset tested — six for six** — by 11% to 114% —
+and beats `parquet+zstd`, the columnar specialist, on every tabular case where it
+applies. Every output is **byte-exact lossless** (verified roundtrip on every run).
 
 ## The honest caveat
 
-This is a **ratio win, not yet a speed win.** augur currently runs ~1 MB/s — roughly
-70x slower than xz to encode. That's the context-mixing tax plus a deliberately naive
-floating-point inner loop (an `exp`/`ln` per bit). It's research-grade today, not a
-drop-in tool. But that's a *known, attackable* engineering problem (integer-domain
-mixing, lookup tables) — a completely different question from "is the idea real,"
-which the numbers above answer.
+**Encode speed is now competitive; decode is the real gap.** augur encodes at
+2.6–4.6 MB/s — in the same range as `xz -9e`, sometimes faster. But context mixing is
+*symmetric*: decode runs the identical model, so it's also ~3 MB/s, while zstd and xz
+decode at hundreds of MB/s to GB/s. For write-once / read-rarely data (archival,
+cold feeds, backups) that's fine; for hot read paths it isn't yet. Closing it means a
+cheaper model on the decode side — a real research problem, not a free lunch. Named,
+not hidden.
 
 ## What's next
 
-- **Make it real:** integer mixer + squash/stretch lookup tables for usable speed.
+- **Decode speed:** cache-friendlier table layout, faster per-byte hashing, and
+  exploring an asymmetric fast-decode mode.
 - **Widen the moat:** CSV column-awareness, a code-aware model, and richer formula
   detection (multi-column dependencies, non-linear sequences).
 - **The deep end:** the same "predict the next thing, code the surprise" socket is
@@ -171,5 +181,6 @@ which the numbers above answer.
 
 One engine. Understand the data, then the small size follows. That's the bet.
 
-*Built in a day. From a 32k-line project that lost to zstd, to a 450-line one that
-beats xz on six datasets — including 7.8M real threats.*
+*Built in a day. From a 32k-line project that lost to zstd, to a ~700-line one that
+beats xz by 11–114% on six datasets — including 7.8M real threats — at competitive
+encode speed.*

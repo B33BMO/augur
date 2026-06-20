@@ -12,14 +12,12 @@
 //!   - a match model (long-range repeats — what byte contexts can't see)
 //!   - STRUCTURE models: a streaming JSON parser exposes "which field's value am
 //!     I inside"; we condition on (field, position) and (field, depth).
-//!   - NUMERIC model: per-field linear extrapolation. For each field it tracks
-//!     last value + delta and predicts the digits of `last + delta` before they
-//!     are read. Auto-increment IDs, timestamps, counters collapse to near-zero.
-//!     This is "the match model, but the source is a formula instead of history".
+//!   - NUMERIC model: per-field linear extrapolation (predicts digits of
+//!     last + delta before they are read). Formula detection for IDs/timestamps.
 //!
-//! The parser/numeric models are deterministic heuristics (not validators), so
-//! they cannot desync and degrade to ignorable extra inputs on non-matching data
-//! (the mixer simply learns to down-weight them).
+//! Math is integer fixed-point: stretch/squash are lookup tables and the mixer
+//! runs in i32/i64, so the inner loop has no transcendental calls. Probabilities
+//! are 12-bit (0..4096); mixer weights are 16.16 fixed-point.
 
 use std::env;
 use std::fs;
@@ -110,31 +108,47 @@ impl<'a> Decoder<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Predictor: portfolio of models + logistic mixer.
+// stretch / squash lookup tables (12-bit prob <-> stretched logit domain).
+// ---------------------------------------------------------------------------
+
+const ST_MIN: i32 = -2047;
+const ST_MAX: i32 = 2047;
+
+fn build_stretch() -> Vec<i32> {
+    // stretch(p) = 256 * ln(p / (4096 - p)), clamped to [-2047, 2047]
+    (0..4096)
+        .map(|p| {
+            let pc = (p as f64).clamp(1.0, 4095.0);
+            (256.0 * (pc / (4096.0 - pc)).ln()).round().clamp(ST_MIN as f64, ST_MAX as f64) as i32
+        })
+        .collect()
+}
+
+fn build_squash() -> Vec<i32> {
+    // squash(d) = 4096 / (1 + e^(-d/256)); index i represents d = i - 2048
+    (0..4096)
+        .map(|i| {
+            let d = (i - 2048) as f64;
+            (4096.0 / (1.0 + (-d / 256.0).exp())).round().clamp(1.0, 4095.0) as i32
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Predictor: portfolio of models + logistic mixer (integer fixed-point).
 // ---------------------------------------------------------------------------
 
 const MEM_BITS: usize = 22;
 const MASK: usize = (1 << MEM_BITS) - 1;
-const NORD: usize = 5; // byte-context orders 0..=4
-const NSTR: usize = 2; // structure-aware models
-const NTAB: usize = NORD + NSTR; // table-backed models
-const NIN: usize = NTAB + 2; // + match model + numeric model
-const MINLEN: usize = 6; // match model min context length
-const RATE: i32 = 4; // context table adaptation rate
-const LR: f64 = 0.02; // mixer learning rate
-const ARRAY_TAG: u32 = 0xA22A_5151; // field tag for array elements
-const NUMSLOTS: usize = 1 << 16; // per-field numeric state slots
-
-#[inline]
-fn stretch(p: f64) -> f64 {
-    let p = p.clamp(1e-6, 1.0 - 1e-6);
-    (p / (1.0 - p)).ln()
-}
-
-#[inline]
-fn squash(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
-}
+const NORD: usize = 5;
+const NSTR: usize = 2;
+const NTAB: usize = NORD + NSTR;
+const NIN: usize = NTAB + 2; // + match + numeric
+const MINLEN: usize = 6;
+const RATE: i32 = 4;
+const LR: i32 = 7; // mixer learning rate (lpaq-style)
+const ARRAY_TAG: u32 = 0xA22A_5151;
+const NUMSLOTS: usize = 1 << 16;
 
 #[inline]
 fn hstep(h: u32, c: u8) -> u32 {
@@ -148,6 +162,12 @@ fn hash_n(buf: &[u8], n: usize, k: usize) -> u32 {
         h = hstep(h, buf[j]);
     }
     h
+}
+
+/// Confidence magnitude in 12-bit prob space from a hit/run count: 2048 -> 4095.
+#[inline]
+fn conf_prob(count: u32) -> usize {
+    (2048 + (2047 * count / (count + 1)) as i32).clamp(2048, 4095) as usize
 }
 
 #[derive(Clone, Copy)]
@@ -169,16 +189,19 @@ struct Predictor {
     buf: Vec<u8>,
     t: Vec<Vec<u16>>,
     mm: Vec<u32>,
+    stretch_tab: Vec<i32>,
+    squash_tab: Vec<i32>,
     // bit-assembly state
     c0: u32,
     bitpos: u32,
     ctxh: [u32; NTAB],
-    // match model state
+    // match model
     mm_on: bool,
     match_ptr: usize,
     match_len: u32,
     pb: u8,
-    // streaming JSON parser state
+    match_mag: i32, // stretched confidence (>=0), recomputed at byte boundary
+    // streaming JSON parser
     in_str: bool,
     esc: bool,
     str_is_key: bool,
@@ -186,7 +209,7 @@ struct Predictor {
     stack: Vec<Frame>,
     vpos: u32,
     value_pending: bool,
-    // numeric model state
+    // numeric model
     num: Vec<NumState>,
     in_num_value: bool,
     cur_num: i64,
@@ -198,22 +221,25 @@ struct Predictor {
     np_len: usize,
     np_ptr: usize,
     np_active: bool,
-    np_conf: f64,
-    // mixer
-    w: Vec<[f64; NIN]>,
+    num_mag: i32, // stretched confidence (>=0)
+    // mixer (16.16 fixed-point weights, one set per previous byte)
+    w: Vec<[i32; NIN]>,
     // cached for update()
     idx: [usize; NTAB],
-    st: [f64; NIN],
+    st: [i32; NIN],
     wsel: usize,
-    p1: f64,
+    pr: i32, // last predicted P(bit=1), 12-bit
 }
 
 impl Predictor {
     fn new() -> Self {
+        let init_w = (1i32 << 16) / NIN as i32;
         let mut p = Self {
             buf: Vec::new(),
             t: vec![vec![2048u16; 1 << MEM_BITS]; NTAB],
             mm: vec![0u32; 1 << MEM_BITS],
+            stretch_tab: build_stretch(),
+            squash_tab: build_squash(),
             c0: 1,
             bitpos: 0,
             ctxh: [0; NTAB],
@@ -221,6 +247,7 @@ impl Predictor {
             match_ptr: 0,
             match_len: 0,
             pb: 0,
+            match_mag: 0,
             in_str: false,
             esc: false,
             str_is_key: false,
@@ -239,12 +266,12 @@ impl Predictor {
             np_len: 0,
             np_ptr: 0,
             np_active: false,
-            np_conf: 0.0,
-            w: vec![[0.15; NIN]; 256],
+            num_mag: 0,
+            w: vec![[init_w; NIN]; 256],
             idx: [0; NTAB],
-            st: [0.0; NIN],
+            st: [0; NIN],
             wsel: 0,
-            p1: 0.5,
+            pr: 2048,
         };
         p.recompute_ctx();
         p
@@ -282,56 +309,56 @@ impl Predictor {
     }
 
     #[inline]
-    fn predict(&mut self) -> f64 {
+    fn predict(&mut self) -> u32 {
         for m in 0..NTAB {
             let idx = (self.ctxh[m] ^ self.c0.wrapping_mul(2_654_435_761)) as usize & MASK;
             self.idx[m] = idx;
-            let p = self.t[m][idx] as f64 / 4096.0;
-            self.st[m] = stretch(p);
+            let tv = (self.t[m][idx] as usize).min(4095);
+            self.st[m] = self.stretch_tab[tv];
         }
-        // match model
-        let mut pmatch = 0.5;
+        // match model: ± precomputed confidence depending on the predicted bit
+        let mut sm = 0;
         if self.mm_on {
             let bp = self.bitpos;
             let placed = self.c0 - (1 << bp);
             if bp == 0 || placed == (self.pb as u32 >> (8 - bp)) {
-                let predbit = (self.pb >> (7 - bp)) & 1;
-                let ml = self.match_len as f64;
-                let conf = (ml / (ml + 1.0)).min(0.97);
-                pmatch = if predbit == 1 { 0.5 + 0.49 * conf } else { 0.5 - 0.49 * conf };
+                sm = if (self.pb >> (7 - bp)) & 1 == 1 { self.match_mag } else { -self.match_mag };
             }
         }
-        self.st[NTAB] = stretch(pmatch);
+        self.st[NTAB] = sm;
         // numeric model
-        let mut pnum = 0.5;
+        let mut sn = 0;
         if self.np_active && self.np_ptr < self.np_len {
             let pbn = self.np_digits[self.np_ptr];
             let bp = self.bitpos;
             let placed = self.c0 - (1 << bp);
             if bp == 0 || placed == (pbn as u32 >> (8 - bp)) {
-                let predbit = (pbn >> (7 - bp)) & 1;
-                pnum = if predbit == 1 { 0.5 + 0.49 * self.np_conf } else { 0.5 - 0.49 * self.np_conf };
+                sn = if (pbn >> (7 - bp)) & 1 == 1 { self.num_mag } else { -self.num_mag };
             }
         }
-        self.st[NTAB + 1] = stretch(pnum);
+        self.st[NTAB + 1] = sn;
 
+        // mix: dot product in 16.16 fixed-point
         self.wsel = *self.buf.last().unwrap_or(&0) as usize;
         let w = &self.w[self.wsel];
-        let mut dot = 0.0;
+        let mut dot: i64 = 0;
         for i in 0..NIN {
-            dot += w[i] * self.st[i];
+            dot += w[i] as i64 * self.st[i] as i64;
         }
-        self.p1 = squash(dot).clamp(1.0 / 4096.0, 4095.0 / 4096.0);
-        self.p1
+        let d = ((dot >> 16) as i32).clamp(ST_MIN, ST_MAX);
+        self.pr = self.squash_tab[(d + 2048) as usize].clamp(1, 4095);
+        self.pr as u32
     }
 
     #[inline]
     fn update(&mut self, bit: u32) {
-        let err = bit as f64 - self.p1;
+        // mixer weight update (integer gradient step)
+        let err = (((bit as i32) << 12) - self.pr) * LR;
         let w = &mut self.w[self.wsel];
         for i in 0..NIN {
-            w[i] += LR * err * self.st[i];
+            w[i] += (self.st[i] * err) >> 16;
         }
+        // context table updates
         let target = (bit * 4096) as i32;
         for m in 0..NTAB {
             let cell = &mut self.t[m][self.idx[m]];
@@ -378,8 +405,10 @@ impl Predictor {
         }
         if self.mm_on && self.match_ptr < self.buf.len() {
             self.pb = self.buf[self.match_ptr];
+            self.match_mag = self.stretch_tab[conf_prob(self.match_len)];
         } else {
             self.mm_on = false;
+            self.match_mag = 0;
         }
 
         // --- streaming JSON parser + numeric model ---
@@ -388,13 +417,8 @@ impl Predictor {
         self.recompute_ctx();
     }
 
-    /// Set up the numeric prediction for the value about to be read in `field`.
     fn set_np(&mut self, field: u32) {
         let slot = self.num[(field as usize) & (NUMSLOTS - 1)];
-        // Activate as soon as a field has been seen once; confidence (np_conf,
-        // from the hit counter) scales how hard the mixer leans on it. Empirically
-        // this beats a hard hit-threshold gate, which cost more on truly sequential
-        // fields than it saved on noisy ones.
         if !slot.seen {
             self.np_active = false;
             return;
@@ -426,8 +450,7 @@ impl Predictor {
         self.np_len = p;
         self.np_ptr = 0;
         self.np_active = true;
-        let h = slot.hits as f64;
-        self.np_conf = (h / (h + 1.0)).min(0.98);
+        self.num_mag = self.stretch_tab[conf_prob(slot.hits)];
     }
 
     fn finalize_numeric(&mut self) {
@@ -463,7 +486,6 @@ impl Predictor {
     }
 
     fn update_struct(&mut self, c: u8) {
-        // ---- inside a string ----
         if self.in_str {
             if self.esc {
                 self.esc = false;
@@ -485,7 +507,6 @@ impl Predictor {
             return;
         }
 
-        // ---- accumulating a bare numeric value ----
         if self.in_num_value {
             if c.is_ascii_digit() {
                 if self.cur_len < 18 {
@@ -498,24 +519,20 @@ impl Predictor {
                 self.vpos = (self.vpos + 1).min(31);
                 return;
             } else {
-                // value ends here. If it's actually a float / scientific form
-                // (`.`, `e`, `E`), don't treat it as an integer sequence — that
-                // would poison the field's delta state with a bogus integer part.
                 if c == b'.' || c == b'e' || c == b'E' {
-                    self.cur_is_num = false;
+                    self.cur_is_num = false; // float / scientific: don't track as int
                 }
-                self.finalize_numeric(); // skips when !cur_is_num
+                self.finalize_numeric();
                 self.in_num_value = false;
                 self.np_active = false;
             }
         }
 
-        // ---- a value is expected: classify its first byte ----
         if self.value_pending {
             match c {
                 b' ' | b'\n' | b'\r' | b'\t' => {
                     self.vpos = 0;
-                    return; // keep pending
+                    return;
                 }
                 b'0'..=b'9' | b'-' => {
                     self.value_pending = false;
@@ -536,12 +553,10 @@ impl Predictor {
                 _ => {
                     self.value_pending = false;
                     self.np_active = false;
-                    // fall through: structural / string / container
                 }
             }
         }
 
-        // ---- structural ----
         match c {
             b'"' => {
                 self.in_str = true;
@@ -606,18 +621,13 @@ impl Predictor {
 // Top-level compress / decompress
 // ---------------------------------------------------------------------------
 
-#[inline]
-fn quantize(p1: f64) -> u32 {
-    ((p1 * 4096.0).round() as i32).clamp(1, 4095) as u32
-}
-
 fn compress(data: &[u8]) -> Vec<u8> {
     let mut pr = Predictor::new();
     let mut enc = Encoder::new();
     for &byte in data {
         for i in (0..8).rev() {
             let bit = ((byte >> i) & 1) as u32;
-            let p = quantize(pr.predict());
+            let p = pr.predict();
             enc.encode(bit, p);
             pr.update(bit);
         }
@@ -632,7 +642,7 @@ fn decompress(comp: &[u8], orig_len: usize) -> Vec<u8> {
     for _ in 0..orig_len {
         let mut byte = 0u8;
         for _ in 0..8 {
-            let p = quantize(pr.predict());
+            let p = pr.predict();
             let bit = dec.decode(p);
             pr.update(bit);
             byte = (byte << 1) | bit as u8;
@@ -674,13 +684,15 @@ fn main() {
 
     let ok = dec == data;
     let ratio = data.len() as f64 / comp.len() as f64;
+    let mbps = data.len() as f64 / 1e6 / enc_t.as_secs_f64();
     println!(
-        "{}\n  {} -> {} bytes   ratio = {:.2}x   enc={:.1}s dec={:.1}s   roundtrip={}",
+        "{}\n  {} -> {} bytes   ratio = {:.2}x   enc={:.1}s ({:.1} MB/s) dec={:.1}s   roundtrip={}",
         path,
         data.len(),
         comp.len(),
         ratio,
         enc_t.as_secs_f64(),
+        mbps,
         dec_t.as_secs_f64(),
         if ok { "OK" } else { "*** FAILED ***" }
     );
