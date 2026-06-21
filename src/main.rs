@@ -802,8 +802,12 @@ impl Predictor {
 // Top-level compress / decompress
 // ---------------------------------------------------------------------------
 
-fn compress(data: &[u8]) -> Vec<u8> {
-    let mode = sniff(data);
+// Container layout: "AUGR" | version(1) | mode(1) | orig_len(8, LE) | stream
+const MAGIC: [u8; 4] = *b"AUGR";
+const VERSION: u8 = 1;
+const HEADER_LEN: usize = 14;
+
+fn encode_stream(data: &[u8], mode: Mode) -> Vec<u8> {
     let mut pr = Predictor::new(mode);
     let mut enc = Encoder::new();
     for &byte in data {
@@ -814,17 +818,12 @@ fn compress(data: &[u8]) -> Vec<u8> {
             pr.update(bit);
         }
     }
-    let stream = enc.finish();
-    let mut out = Vec::with_capacity(stream.len() + 1);
-    out.push(mode.to_byte()); // container header: format mode
-    out.extend_from_slice(&stream);
-    out
+    enc.finish()
 }
 
-fn decompress(comp: &[u8], orig_len: usize) -> Vec<u8> {
-    let mode = Mode::from_byte(comp[0]);
+fn decode_stream(stream: &[u8], mode: Mode, orig_len: usize) -> Vec<u8> {
     let mut pr = Predictor::new(mode);
-    let mut dec = Decoder::new(&comp[1..]);
+    let mut dec = Decoder::new(stream);
     let mut out = Vec::with_capacity(orig_len);
     for _ in 0..orig_len {
         let mut byte = 0u8;
@@ -839,24 +838,126 @@ fn decompress(comp: &[u8], orig_len: usize) -> Vec<u8> {
     out
 }
 
+fn compress(data: &[u8]) -> Vec<u8> {
+    let mode = sniff(data);
+    let stream = encode_stream(data, mode);
+    let mut out = Vec::with_capacity(stream.len() + HEADER_LEN);
+    out.extend_from_slice(&MAGIC);
+    out.push(VERSION);
+    out.push(mode.to_byte());
+    out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    out.extend_from_slice(&stream);
+    out
+}
+
+fn decompress(container: &[u8]) -> Result<Vec<u8>, String> {
+    if container.len() < HEADER_LEN || container[0..4] != MAGIC {
+        return Err("not an augur file (bad magic)".into());
+    }
+    if container[4] != VERSION {
+        return Err(format!("unsupported augur version {}", container[4]));
+    }
+    let mode = Mode::from_byte(container[5]);
+    let orig_len = u64::from_le_bytes(container[6..14].try_into().unwrap()) as usize;
+    Ok(decode_stream(&container[HEADER_LEN..], mode, orig_len))
+}
+
 fn main() {
-    {
-        let test = b"the quick brown fox the quick brown fox 1 2 3 4 5 6 7 8 9 10 11 12 13";
-        let c = compress(test);
-        let d = decompress(&c, test.len());
-        assert!(d == test, "SELF-TEST ROUNDTRIP FAILED");
-        eprintln!("self-test ok ({} -> {} bytes)", test.len(), c.len());
-    }
-
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: augur <file> [sample_bytes]");
-        return;
+    match args.get(1).map(String::as_str) {
+        Some("compress") | Some("c") => cmd_compress(&args[2..]),
+        Some("decompress") | Some("d") => cmd_decompress(&args[2..]),
+        Some("bench") => cmd_bench(&args[2..]),
+        _ => {
+            eprintln!("augur — structure-aware lossless compressor\n");
+            eprintln!("usage:");
+            eprintln!("  augur compress   <file> [-o out.augur]   compress to <file>.augur");
+            eprintln!("  augur decompress <file.augur> [-o out]   restore the original");
+            eprintln!("  augur bench      <file> [sample_bytes]   compress+verify+time in memory");
+        }
     }
-    let path = &args[1];
-    let limit: Option<usize> = args.get(2).and_then(|s| s.parse().ok());
+}
 
-    let mut data = fs::read(path).expect("read input");
+fn parse_io(args: &[String], default_out: impl Fn(&str) -> String) -> (String, String) {
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--output" => {
+                i += 1;
+                output = args.get(i).cloned();
+            }
+            s if input.is_none() => input = Some(s.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    let input = input.unwrap_or_else(|| {
+        eprintln!("error: no input file");
+        std::process::exit(2);
+    });
+    let output = output.unwrap_or_else(|| default_out(&input));
+    (input, output)
+}
+
+fn read_or_die(path: &str) -> Vec<u8> {
+    fs::read(path).unwrap_or_else(|e| {
+        eprintln!("error: cannot read {path}: {e}");
+        std::process::exit(1);
+    })
+}
+
+fn write_or_die(path: &str, data: &[u8]) {
+    fs::write(path, data).unwrap_or_else(|e| {
+        eprintln!("error: cannot write {path}: {e}");
+        std::process::exit(1);
+    });
+}
+
+fn cmd_compress(args: &[String]) {
+    let (input, output) = parse_io(args, |i| format!("{i}.augur"));
+    let data = read_or_die(&input);
+    let t0 = Instant::now();
+    let comp = compress(&data);
+    let dt = t0.elapsed().as_secs_f64();
+    write_or_die(&output, &comp);
+    let ratio = if comp.is_empty() { 0.0 } else { data.len() as f64 / comp.len() as f64 };
+    let mbps = data.len() as f64 / 1e6 / dt.max(1e-9);
+    println!(
+        "{input} ({} B) -> {output} ({} B)   ratio={ratio:.2}x   {mbps:.1} MB/s",
+        data.len(),
+        comp.len()
+    );
+}
+
+fn cmd_decompress(args: &[String]) {
+    let (input, output) = parse_io(args, |i| {
+        i.strip_suffix(".augur").map(str::to_string).unwrap_or_else(|| format!("{i}.out"))
+    });
+    let comp = read_or_die(&input);
+    let t0 = Instant::now();
+    let data = decompress(&comp).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
+    let dt = t0.elapsed().as_secs_f64();
+    write_or_die(&output, &data);
+    let mbps = data.len() as f64 / 1e6 / dt.max(1e-9);
+    println!("{input} -> {output} ({} B)   {mbps:.1} MB/s", data.len());
+}
+
+fn cmd_bench(args: &[String]) {
+    // self-test: prove roundtrip on a tiny mixed input first
+    let test = b"the quick brown fox the quick brown fox 1 2 3 4 5 6 7 8 9 10 11 12 13";
+    assert!(decompress(&compress(test)).unwrap() == test, "SELF-TEST ROUNDTRIP FAILED");
+
+    let Some(input) = args.first().cloned() else {
+        eprintln!("usage: augur bench <file> [sample_bytes]");
+        return;
+    };
+    let limit: Option<usize> = args.get(1).and_then(|s| s.parse().ok());
+    let mut data = read_or_die(&input);
     if let Some(l) = limit {
         data.truncate(l);
     }
@@ -864,22 +965,19 @@ fn main() {
     let t0 = Instant::now();
     let comp = compress(&data);
     let enc_t = t0.elapsed();
-
     let t1 = Instant::now();
-    let dec = decompress(&comp, data.len());
+    let dec = decompress(&comp).unwrap();
     let dec_t = t1.elapsed();
 
     let ok = dec == data;
     let ratio = data.len() as f64 / comp.len() as f64;
-    let mbps = data.len() as f64 / 1e6 / enc_t.as_secs_f64();
+    let enc_mbps = data.len() as f64 / 1e6 / enc_t.as_secs_f64();
+    let dec_mbps = data.len() as f64 / 1e6 / dec_t.as_secs_f64();
     println!(
-        "{}\n  {} -> {} bytes   ratio = {:.2}x   enc={:.1}s ({:.1} MB/s) dec={:.1}s   roundtrip={}",
-        path,
+        "{input}\n  {} -> {} bytes   ratio={ratio:.2}x   enc={:.1}s ({enc_mbps:.1} MB/s) dec={:.1}s ({dec_mbps:.1} MB/s)   roundtrip={}",
         data.len(),
         comp.len(),
-        ratio,
         enc_t.as_secs_f64(),
-        mbps,
         dec_t.as_secs_f64(),
         if ok { "OK" } else { "*** FAILED ***" }
     );
