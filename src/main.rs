@@ -985,3 +985,106 @@ fn cmd_bench(args: &[String]) {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(data: &[u8]) {
+        let comp = compress(data);
+        let back = decompress(&comp).expect("decompress should succeed on our own output");
+        assert!(back == data, "roundtrip mismatch (len {})", data.len());
+    }
+
+    // deterministic pseudo-random bytes (no rng dependency)
+    fn pseudo_random(n: usize) -> Vec<u8> {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x & 0xff) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty() {
+        roundtrip(b"");
+    }
+
+    #[test]
+    fn one_byte() {
+        roundtrip(b"A");
+        roundtrip(&[0u8]);
+        roundtrip(&[255u8]);
+    }
+
+    #[test]
+    fn all_same_byte() {
+        roundtrip(&vec![0x7e; 50_000]);
+    }
+
+    #[test]
+    fn incompressible_random() {
+        // must still roundtrip even though it will expand
+        roundtrip(&pseudo_random(50_000));
+    }
+
+    #[test]
+    fn all_byte_values() {
+        let v: Vec<u8> = (0..=255u16).map(|b| b as u8).cycle().take(50_000).collect();
+        roundtrip(&v);
+    }
+
+    #[test]
+    fn ndjson_sequential() {
+        let mut s = String::new();
+        for i in 0..5_000 {
+            s.push_str(&format!("{{\"id\":{},\"ts\":{},\"v\":\"x\"}}\n", 1000 + i, 1_700_000_000 + i));
+        }
+        roundtrip(s.as_bytes());
+    }
+
+    #[test]
+    fn csv_rows() {
+        let mut s = String::from("a,b,c\n");
+        for i in 0..5_000 {
+            s.push_str(&format!("{},{},tag{}\n", i, i * 2, i % 7));
+        }
+        roundtrip(s.as_bytes());
+    }
+
+    #[test]
+    fn malformed_json_is_safe() {
+        // the parser is a heuristic, not a validator — must never panic or desync
+        roundtrip(b"{{{not valid,,,]]] \"unterminated\n\\\\\x00\x01\xff garbage");
+    }
+
+    #[test]
+    fn csv_with_quotes_and_commas() {
+        roundtrip(b"\"a\",\"b,c\",\"d\"\"e\"\n1,2,3\n,,\n");
+    }
+
+    #[test]
+    fn negative_and_big_numbers() {
+        let mut s = String::new();
+        for i in 0..2_000 {
+            s.push_str(&format!("{{\"x\":{},\"y\":{}}}\n", -1000 + i, 9_000_000_000_000_000_000i64 - i as i64));
+        }
+        roundtrip(s.as_bytes());
+    }
+
+    #[test]
+    fn decompress_rejects_garbage() {
+        assert!(decompress(b"").is_err());
+        assert!(decompress(b"not an augur file at all").is_err());
+        // valid magic, unsupported version
+        let mut bad = MAGIC.to_vec();
+        bad.push(99);
+        bad.push(1);
+        bad.extend_from_slice(&[0u8; 8]);
+        assert!(decompress(&bad).is_err());
+    }
+}

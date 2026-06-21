@@ -63,7 +63,14 @@ The portfolio:
 ## Honest caveats
 
 - **Encode is fast (~5 MB/s, faster than `xz -9e`); decode is the gap.** Context mixing is symmetric and serial — each bit must be decoded before the next can be predicted, so decode (~3–4 MB/s) can't pipeline like encode, and it's far slower than zstd/xz's GB/s decode. augur is ideal for **write-once / read-rarely** data (archival, cold feeds, backups). Closing the decode gap needs a fundamentally cheaper decode-side model — open work.
-- **Best on structured data** (JSON, NDJSON, CSV, logs, DB exports). On already-compressed or high-entropy data there's nothing to understand, and it will only match the best general compressors, not beat them.
+- **It's a structure/text specialist, not a universal ratio king.** augur wins on structured data (JSON, NDJSON, CSV, logs, DB exports) and is also ahead on plain text. It is **behind xz on binary/executable data**, and on already-compressed or random data there's nothing to model — it correctly punts to ~1.0x (a few bytes of container overhead). Reach for it where the data has structure to understand.
+
+## Testing
+
+```bash
+cargo test          # roundtrip + robustness suite (empty, 1-byte, random,
+                    # all-byte-values, malformed JSON, quoted CSV, garbage rejection, …)
+```
 
 ## License
 
