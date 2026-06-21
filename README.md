@@ -2,7 +2,7 @@
 
 **A structure-aware, lossless compressor that beats `xz -9e` by understanding your data instead of just packing bytes.**
 
-augur is a from-scratch context-mixing compressor built on one idea: **compression is prediction.** Predict the next bit, code only the surprise. A logistic mixer blends a portfolio of predictors — local context, long-range matches, and *structure-aware* models that understand JSON fields and CSV columns — feeding a single arithmetic coder. The encoder and decoder run the identical predict→code→update loop, so they can never desync.
+augur is a from-scratch context-mixing compressor built on one idea: **compression is prediction.** Predict the next bit, code only the surprise. A logistic mixer blends a portfolio of predictors — local context, long-range matches, and *structure-aware* models that understand JSON fields, CSV columns, and SQL-dump tuples — feeding a single arithmetic coder. The encoder and decoder run the identical predict→code→update loop, so they can never desync.
 
 It has **zero dependencies** (not even for the CLI) and is a single ~830-line Rust file.
 
@@ -17,6 +17,7 @@ Compression ratio (higher is better), full files, byte-exact lossless:
 | taxi.csv | 8.12x | 8.45x | 6.18x | **11.66x** | +38% |
 | taxi.ndjson | 27.98x | 31.84x | 33.50x | **41.57x** | +31% |
 | threats.ndjson (real DB export) | 11.71x | 12.76x | — | **16.03x** | +26% |
+| threats.sql (real DB dump) | 6.72x | 7.25x | — | **9.01x** | +24% |
 | seq.ndjson (sequential IDs/timestamps) | 11.37x | 15.19x | — | **32.46x** | +114% |
 
 augur beats `xz -9e` on every dataset tested, and beats `parquet+zstd` (the columnar specialist) on every tabular case where it applies.
@@ -60,7 +61,7 @@ The portfolio:
 
 - **Order 0–4 context models** — local byte statistics.
 - **Match model** — long-range repeats, the redundancy a local model structurally cannot see (and the main reason general LZ compressors win on structured data).
-- **Structure models** — a streaming, format-aware parser exposes *semantic position*: which JSON field's value, or which CSV column, you're currently inside. Byte-level coders can't condition on "I'm reading the value of `created_at`"; augur can. The format is sniffed at compress time and recorded in a one-byte header, so the decoder configures the same parser.
+- **Structure models** — a streaming, format-aware parser exposes *semantic position*: which JSON field's value, which CSV column, or which SQL `INSERT ... VALUES` tuple column you're currently inside. Byte-level coders can't condition on "I'm reading the value of `created_at`"; augur can. The format (JSON / CSV / SQL / generic) is sniffed at compress time and recorded in a one-byte header, so the decoder configures the same parser.
 - **Numeric model** — per-field linear extrapolation. For each field it tracks the last value and delta and predicts the digits of `last + delta` *before reading them*. Auto-increment IDs, timestamps, and counters collapse to near-zero bits. When a field isn't predictable, the mixer simply learns to ignore it.
 
 ### Container format

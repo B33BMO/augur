@@ -157,6 +157,7 @@ enum Mode {
     Generic,
     Json,
     Csv,
+    Sql,
 }
 
 impl Mode {
@@ -165,20 +166,27 @@ impl Mode {
             Mode::Generic => 0,
             Mode::Json => 1,
             Mode::Csv => 2,
+            Mode::Sql => 3,
         }
     }
     fn from_byte(b: u8) -> Mode {
         match b {
             1 => Mode::Json,
             2 => Mode::Csv,
+            3 => Mode::Sql,
             _ => Mode::Generic,
         }
     }
 }
 
+#[inline]
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    needle.len() <= hay.len() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Sniff the data format from a prefix. The result is stored in the container
-/// header so the decoder configures the same parser — the JSON and CSV models
-/// never run at once and so never interfere.
+/// header so the decoder configures the same parser — the format parsers never
+/// run at once and so never interfere.
 fn sniff(data: &[u8]) -> Mode {
     let sample = &data[..data.len().min(65536)];
     let first = sample.iter().copied().find(|b| !b.is_ascii_whitespace());
@@ -195,6 +203,8 @@ fn sniff(data: &[u8]) -> Mode {
     }
     if matches!(first, Some(b'{') | Some(b'[')) && braces * 2 >= lines {
         Mode::Json
+    } else if contains(sample, b"INSERT INTO") || contains(sample, b"CREATE TABLE") {
+        Mode::Sql
     } else if commas >= lines {
         Mode::Csv
     } else {
@@ -206,6 +216,12 @@ fn sniff(data: &[u8]) -> Mode {
 #[inline]
 fn csv_field(col: u32) -> u32 {
     col.wrapping_mul(0x9e37_79b1) ^ 0xC5C5_3737
+}
+
+/// Field identity for a SQL tuple column at a given paren depth.
+#[inline]
+fn sql_field(col: u32, depth: u32) -> u32 {
+    col.wrapping_mul(0x9e37_79b1) ^ depth.wrapping_mul(0x85eb_ca6b) ^ 0x5917_9179
 }
 
 #[inline]
@@ -336,6 +352,11 @@ struct Predictor {
     csv_col: u32,
     csv_in_quote: bool,
     csv_value_pending: bool,
+    // SQL parser state
+    sql_col: u32,
+    sql_depth: u32,
+    sql_value_pending: bool,
+    sql_col_stack: [u32; 33],
     // numeric model
     num: Vec<NumState>,
     in_num_value: bool,
@@ -381,6 +402,10 @@ impl Predictor {
             csv_col: 0,
             csv_in_quote: false,
             csv_value_pending: true,
+            sql_col: 0,
+            sql_depth: 0,
+            sql_value_pending: false,
+            sql_col_stack: [0; 33],
             num: vec![NumState::default(); NUMSLOTS],
             in_num_value: false,
             cur_num: 0,
@@ -427,6 +452,7 @@ impl Predictor {
         let (field, aux) = match self.mode {
             Mode::Json => (self.field_hash(), self.stack.len().min(15) as u32),
             Mode::Csv => (csv_field(self.csv_col), self.csv_col),
+            Mode::Sql => (sql_field(self.sql_col, self.sql_depth), self.sql_col),
             Mode::Generic => (0, 0),
         };
         let in_val_str = (self.in_str && !self.str_is_key) as u32;
@@ -514,6 +540,7 @@ impl Predictor {
         match self.mode {
             Mode::Json => self.update_struct_json(byte),
             Mode::Csv => self.update_struct_csv(byte),
+            Mode::Sql => self.update_struct_sql(byte),
             Mode::Generic => self.update_struct_generic(byte),
         }
 
@@ -739,6 +766,111 @@ impl Predictor {
                 self.vpos = 0;
             }
             _ => {
+                self.vpos = (self.vpos + 1).min(31);
+            }
+        }
+    }
+
+    /// SQL-dump parser: the bulk of a dump is `INSERT INTO t VALUES (..),(..)`.
+    /// Each parenthesized tuple is treated like a CSV row — column index resets at
+    /// `(`, increments at top-level `,`, ends at `)` — and the numeric model is
+    /// routed per (column, depth), so auto-increment ids and sequential timestamps
+    /// collapse. SQL string literals use single quotes (with `\` and `''` escaping).
+    fn update_struct_sql(&mut self, c: u8) {
+        if self.in_str {
+            if self.esc {
+                self.esc = false;
+            } else if c == b'\\' {
+                self.esc = true;
+            } else if c == b'\'' {
+                self.in_str = false;
+            }
+            self.in_num_value = false;
+            self.np_active = false;
+            self.vpos = (self.vpos + 1).min(31);
+            return;
+        }
+
+        if self.in_num_value {
+            if c.is_ascii_digit() {
+                if self.cur_len < 18 {
+                    self.cur_num = self.cur_num * 10 + (c - b'0') as i64;
+                    self.cur_len += 1;
+                } else {
+                    self.cur_is_num = false;
+                }
+                self.np_consume(c);
+                self.vpos = (self.vpos + 1).min(31);
+                return;
+            } else {
+                if c == b'.' || c == b'e' || c == b'E' {
+                    self.cur_is_num = false;
+                }
+                self.finalize_numeric();
+                self.in_num_value = false;
+                self.np_active = false;
+            }
+        }
+
+        match c {
+            b'\'' => {
+                self.in_str = true;
+                self.esc = false;
+                self.sql_value_pending = false;
+                self.np_active = false;
+                self.vpos = 0;
+            }
+            b'(' => {
+                if (self.sql_depth as usize) < self.sql_col_stack.len() {
+                    self.sql_col_stack[self.sql_depth as usize] = self.sql_col;
+                }
+                self.sql_depth = self.sql_depth.saturating_add(1).min(32);
+                self.sql_col = 0;
+                self.sql_value_pending = true;
+                let f = sql_field(self.sql_col, self.sql_depth);
+                self.set_np(f);
+                self.vpos = 0;
+            }
+            b')' => {
+                self.np_active = false;
+                if self.sql_depth > 0 {
+                    self.sql_depth -= 1;
+                    self.sql_col = self.sql_col_stack[self.sql_depth as usize];
+                }
+                self.sql_value_pending = false;
+                self.vpos = 0;
+            }
+            b',' => {
+                self.np_active = false;
+                self.sql_col = self.sql_col.wrapping_add(1);
+                self.sql_value_pending = true;
+                let f = sql_field(self.sql_col, self.sql_depth);
+                self.set_np(f);
+                self.vpos = 0;
+            }
+            b' ' | b'\n' | b'\r' | b'\t' => {
+                self.vpos = 0;
+            }
+            _ => {
+                if self.sql_value_pending {
+                    self.sql_value_pending = false;
+                    if (c.is_ascii_digit() || c == b'-') && self.sql_depth > 0 {
+                        self.in_num_value = true;
+                        self.cur_is_num = true;
+                        self.cur_neg = c == b'-';
+                        self.cur_num = 0;
+                        self.cur_len = 0;
+                        self.cur_field = sql_field(self.sql_col, self.sql_depth);
+                        if c != b'-' {
+                            self.cur_num = (c - b'0') as i64;
+                            self.cur_len = 1;
+                        }
+                        self.np_consume(c);
+                    } else {
+                        self.in_num_value = false;
+                        self.np_active = false;
+                    }
+                }
                 self.vpos = (self.vpos + 1).min(31);
             }
         }
@@ -1078,6 +1210,21 @@ mod tests {
         let mut s = String::from("a,b,c\n");
         for i in 0..5_000 {
             s.push_str(&format!("{},{},tag{}\n", i, i * 2, i % 7));
+        }
+        roundtrip(s.as_bytes());
+    }
+
+    #[test]
+    fn sql_dump() {
+        let mut s = String::from("CREATE TABLE t (id int, ts int, name varchar(64));\n");
+        for batch in 0..200 {
+            s.push_str("INSERT INTO `t` VALUES ");
+            for i in 0..25 {
+                let id = batch * 25 + i;
+                s.push_str(&format!("({},{},'it''s name{}')", 1000 + id, 1_700_000_000 + id, id % 9));
+                if i < 24 { s.push(','); }
+            }
+            s.push_str(";\n");
         }
         roundtrip(s.as_bytes());
     }

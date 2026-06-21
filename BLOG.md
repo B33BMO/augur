@@ -166,6 +166,17 @@ genuine long repeats with far fewer false hits. Pure win, no regressions: nci ju
 to 19.9x, samba flipped to a win (Silesia went 8→9 of 13 files), and every structured
 dataset ticked up (taxi.csv +5%, taxi.ndjson +2.6%, xml +4%).
 
+## Step 8: SQL dumps
+
+Database dumps (`mysqldump`/`pg_dump`) are mostly `INSERT INTO t VALUES (..),(..)` —
+which is the *ideal* augur target: every tuple is a row of correlated columns, full
+of auto-increment ids and sequential timestamps. So a new format mode treats each
+parenthesized tuple like a CSV row (column index resets at `(`, bumps at top-level
+`,`, ends at `)`) and routes the numeric model per column. On a real DB dump (the
+Evil-DB threats exported as SQL): augur **9.01x** vs xz 7.25x, zstd 6.72x — **+24%
+over xz**. Format is auto-sniffed and recorded in the header, so the decoder uses the
+same parser; roundtrip byte-exact.
+
 ## Results
 
 augur vs the best general-purpose compressors, full files, compression ratio
@@ -179,8 +190,9 @@ augur vs the best general-purpose compressors, full files, compression ratio
 | taxi.ndjson | 26.12x | 27.98x | 31.84x | 33.50x | **41.57x** |
 | seq.ndjson (synthetic) | — | 11.37x | 15.19x | — | **32.46x** |
 | threats.ndjson (real) | — | 11.71x | 12.76x | — | **16.03x** |
+| threats.sql (real DB dump) | — | 6.72x | 7.25x | — | **9.01x** |
 
-augur beats `xz -9e` on **every dataset tested — six for six** — by 11% to 114% —
+augur beats `xz -9e` on **every dataset tested — seven for seven** — by 11% to 114% —
 and beats `parquet+zstd`, the columnar specialist, on every tabular case where it
 applies. Every output is **byte-exact lossless** (verified roundtrip on every run).
 
