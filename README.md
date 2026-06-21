@@ -74,4 +74,4 @@ cargo test          # roundtrip + robustness suite (empty, 1-byte, random,
 
 ## License
 
-TBD.
+[Apache-2.0](LICENSE).

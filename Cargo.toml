@@ -2,6 +2,11 @@
 name = "augur"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+description = "Structure-aware lossless compressor that beats xz on structured data by predicting, not packing."
+repository = "https://github.com/B33BMO/augur"
+keywords = ["compression", "lossless", "context-mixing", "json", "csv"]
+categories = ["compression", "command-line-utilities"]
 
 # augur — "predict, don't pack". A from-scratch context-mixing compressor.
 # Thesis: compression == prediction. One binary arithmetic coder fed by a
