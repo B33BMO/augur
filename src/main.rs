@@ -259,23 +259,47 @@ struct NumState {
     seen: bool,
 }
 
-/// A match-model predictor: finds where the current `minlen`-byte context last
-/// occurred and predicts that the following bytes will repeat. A longer `minlen`
-/// finds longer, more reliable repeats (fewer hash collisions); a shorter one
-/// re-acquires faster. The prediction strength grows with the run length.
+const MAX_CHAIN: usize = 8; // hash-chain candidates examined per acquire
+const MAX_BACK: usize = 64; // backward context bytes compared to rank candidates
+
+/// How far back the bytes before `cand` match the bytes before `cur` (capped).
+#[inline]
+fn backmatch(buf: &[u8], cand: usize, cur: usize, cap: usize) -> u32 {
+    let mut k = 0;
+    while k < cap && k < cand && k < cur && buf[cand - 1 - k] == buf[cur - 1 - k] {
+        k += 1;
+    }
+    k as u32
+}
+
+/// A match-model predictor with hash chains: on a miss it walks the chain of
+/// recent positions sharing the current `minlen`-byte context and picks the
+/// candidate whose *preceding* bytes match the current context the longest — so
+/// it locks onto genuine long repeats instead of the most-recent coincidence
+/// (what let LZMA beat the single-position version on highly repetitive data).
 struct MatchModel {
-    table: Vec<u32>, // context hash -> position of the byte that followed last time
+    head: Vec<u32>, // context hash -> latest position of the following byte (0 = none)
+    prev: Vec<u32>, // (pos & MASK) -> previous position in the chain (0 = end)
     minlen: usize,
     on: bool,
-    ptr: usize, // position in buf of the predicted next byte
-    len: u32,   // current match run length (confidence)
-    pb: u8,     // predicted byte
-    mag: i32,   // stretched confidence magnitude, recomputed at byte boundary
+    ptr: usize,
+    len: u32,
+    pb: u8,
+    mag: i32,
 }
 
 impl MatchModel {
     fn new(minlen: usize) -> Self {
-        Self { table: vec![0u32; 1 << MEM_BITS], minlen, on: false, ptr: 0, len: 0, pb: 0, mag: 0 }
+        Self {
+            head: vec![0u32; 1 << MEM_BITS],
+            prev: vec![0u32; 1 << MEM_BITS],
+            minlen,
+            on: false,
+            ptr: 0,
+            len: 0,
+            pb: 0,
+            mag: 0,
+        }
     }
 
     /// Per-bit stretched contribution for the mixer (0 when off or off-track).
@@ -292,9 +316,10 @@ impl MatchModel {
         }
     }
 
-    /// Advance the model at a byte boundary. `buf` already includes `byte`.
+    /// Advance at a byte boundary. `buf` already includes `byte`.
     fn update(&mut self, buf: &[u8], byte: u8, stretch_tab: &[i32]) {
         let n = buf.len();
+        // continue an active match
         if self.on && buf[self.ptr] == byte {
             self.ptr += 1;
             self.len += 1;
@@ -309,14 +334,36 @@ impl MatchModel {
         if n >= self.minlen {
             let h = hash_n(buf, n, self.minlen) as usize & MASK;
             if !self.on {
-                let cand = self.table[h] as usize;
-                if cand != 0 && cand < n {
-                    self.ptr = cand;
+                // walk the chain; pick the candidate with the longest backward context match
+                let mut cand = self.head[h] as usize;
+                let mut depth = 0;
+                let mut best_pos = 0usize;
+                let mut best_back = 0u32;
+                while cand != 0 && cand < n && depth < MAX_CHAIN {
+                    let back = backmatch(buf, cand, n, MAX_BACK);
+                    if back > best_back {
+                        best_back = back;
+                        best_pos = cand;
+                    }
+                    let np = self.prev[cand & MASK] as usize;
+                    if np == 0 || np >= cand {
+                        break; // end of chain / stale alias guard
+                    }
+                    cand = np;
+                    depth += 1;
+                }
+                if best_back >= 1 {
+                    self.ptr = best_pos;
                     self.on = true;
-                    self.len = 0;
+                    // chains pick a better *candidate*, but a fresh match starts only
+                    // mildly confident so it can't override the structure/numeric models
+                    // on structured data; a long ride still climbs to full confidence.
+                    self.len = best_back.min(8);
                 }
             }
-            self.table[h] = n as u32;
+            // link the current position into the chain for this context
+            self.prev[n & MASK] = self.head[h];
+            self.head[h] = n as u32;
         }
         if self.on && self.ptr < n {
             self.pb = buf[self.ptr];
