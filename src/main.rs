@@ -158,6 +158,7 @@ enum Mode {
     Json,
     Csv,
     Sql,
+    Xml,
 }
 
 impl Mode {
@@ -167,6 +168,7 @@ impl Mode {
             Mode::Json => 1,
             Mode::Csv => 2,
             Mode::Sql => 3,
+            Mode::Xml => 4,
         }
     }
     fn from_byte(b: u8) -> Mode {
@@ -174,6 +176,7 @@ impl Mode {
             1 => Mode::Json,
             2 => Mode::Csv,
             3 => Mode::Sql,
+            4 => Mode::Xml,
             _ => Mode::Generic,
         }
     }
@@ -203,6 +206,10 @@ fn sniff(data: &[u8]) -> Mode {
     }
     if matches!(first, Some(b'{') | Some(b'[')) && braces * 2 >= lines {
         Mode::Json
+    } else if matches!(first, Some(b'<'))
+        && (contains(sample, b"</") || contains(sample, b"<?xml") || contains(sample, b"/>"))
+    {
+        Mode::Xml
     } else if contains(sample, b"INSERT INTO") || contains(sample, b"CREATE TABLE") {
         Mode::Sql
     } else if commas >= lines {
@@ -404,6 +411,16 @@ struct Predictor {
     sql_depth: u32,
     sql_value_pending: bool,
     sql_col_stack: [u32; 33],
+    // XML parser state
+    xml_stack: Vec<u32>,
+    xml_in_tag: bool,
+    xml_in_attr: bool,
+    xml_aq: u8,
+    xml_cur_hash: u32,
+    xml_reading: bool,
+    xml_name_started: bool,
+    xml_close: bool,
+    xml_selfclose: bool,
     // numeric model
     num: Vec<NumState>,
     in_num_value: bool,
@@ -453,6 +470,15 @@ impl Predictor {
             sql_depth: 0,
             sql_value_pending: false,
             sql_col_stack: [0; 33],
+            xml_stack: Vec::with_capacity(32),
+            xml_in_tag: false,
+            xml_in_attr: false,
+            xml_aq: 0,
+            xml_cur_hash: 0,
+            xml_reading: false,
+            xml_name_started: false,
+            xml_close: false,
+            xml_selfclose: false,
             num: vec![NumState::default(); NUMSLOTS],
             in_num_value: false,
             cur_num: 0,
@@ -500,6 +526,11 @@ impl Predictor {
             Mode::Json => (self.field_hash(), self.stack.len().min(15) as u32),
             Mode::Csv => (csv_field(self.csv_col), self.csv_col),
             Mode::Sql => (sql_field(self.sql_col, self.sql_depth), self.sql_col),
+            Mode::Xml => {
+                let tag = *self.xml_stack.last().unwrap_or(&0);
+                let state = if self.xml_in_attr { 2u32 } else if self.xml_in_tag { 1 } else { 0 };
+                (tag ^ state.wrapping_mul(0x68e3_1da4), self.xml_stack.len().min(15) as u32)
+            }
             Mode::Generic => (0, 0),
         };
         let in_val_str = (self.in_str && !self.str_is_key) as u32;
@@ -588,6 +619,7 @@ impl Predictor {
             Mode::Json => self.update_struct_json(byte),
             Mode::Csv => self.update_struct_csv(byte),
             Mode::Sql => self.update_struct_sql(byte),
+            Mode::Xml => self.update_struct_xml(byte),
             Mode::Generic => self.update_struct_generic(byte),
         }
 
@@ -918,6 +950,78 @@ impl Predictor {
                         self.np_active = false;
                     }
                 }
+                self.vpos = (self.vpos + 1).min(31);
+            }
+        }
+    }
+
+    /// XML/HTML parser: exposes the current element tag plus parser state
+    /// (in-tag / in-attribute-value / in-text) as the semantic context, so each
+    /// element's content and attributes are modeled separately. Heuristic, not a
+    /// validator — comments/CDATA/PIs fall through harmlessly and deterministically.
+    fn update_struct_xml(&mut self, c: u8) {
+        if self.xml_in_attr {
+            if c == self.xml_aq {
+                self.xml_in_attr = false;
+            }
+            self.vpos = (self.vpos + 1).min(31);
+            return;
+        }
+        if self.xml_in_tag {
+            match c {
+                b'"' | b'\'' => {
+                    self.xml_in_attr = true;
+                    self.xml_aq = c;
+                    self.vpos = 0;
+                }
+                b'>' => {
+                    self.xml_in_tag = false;
+                    if self.xml_close {
+                        self.xml_stack.pop();
+                    } else if !self.xml_selfclose {
+                        if self.xml_stack.len() < 64 {
+                            self.xml_stack.push(self.xml_cur_hash);
+                        }
+                    }
+                    self.vpos = 0;
+                }
+                b'/' => {
+                    if !self.xml_name_started {
+                        self.xml_close = true; // </tag>
+                    } else {
+                        self.xml_selfclose = true; // <tag .../>
+                    }
+                    self.vpos = (self.vpos + 1).min(31);
+                }
+                b' ' | b'\n' | b'\r' | b'\t' => {
+                    self.xml_reading = false; // tag name ended; attributes follow
+                    self.vpos = 0;
+                }
+                _ => {
+                    if self.xml_reading {
+                        self.xml_cur_hash = hstep(self.xml_cur_hash, c);
+                        self.xml_name_started = true;
+                    }
+                    self.vpos = (self.vpos + 1).min(31);
+                }
+            }
+            return;
+        }
+        // text content between tags
+        match c {
+            b'<' => {
+                self.xml_in_tag = true;
+                self.xml_reading = true;
+                self.xml_name_started = false;
+                self.xml_close = false;
+                self.xml_selfclose = false;
+                self.xml_cur_hash = 0x9e37_79b1;
+                self.vpos = 0;
+            }
+            b' ' | b'\n' | b'\r' | b'\t' => {
+                self.vpos = 0;
+            }
+            _ => {
                 self.vpos = (self.vpos + 1).min(31);
             }
         }
@@ -1273,6 +1377,19 @@ mod tests {
             }
             s.push_str(";\n");
         }
+        roundtrip(s.as_bytes());
+    }
+
+    #[test]
+    fn xml_doc() {
+        let mut s = String::from("<?xml version=\"1.0\"?>\n<catalog>\n");
+        for i in 0..3000 {
+            s.push_str(&format!(
+                "  <item id=\"{}\"><name>thing {}</name><price>{}</price><tag/></item>\n",
+                i, i % 50, i * 3
+            ));
+        }
+        s.push_str("</catalog>\n");
         roundtrip(s.as_bytes());
     }
 
