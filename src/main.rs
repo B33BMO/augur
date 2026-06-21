@@ -151,6 +151,7 @@ const RATE: i32 = 4;
 const LR: i32 = 7; // mixer learning rate (lpaq-style)
 const ARRAY_TAG: u32 = 0xA22A_5151;
 const NUMSLOTS: usize = 1 << 16;
+const MAXCOL: usize = 32; // columns tracked per row for cross-column formula detection
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -434,6 +435,13 @@ struct Predictor {
     np_ptr: usize,
     np_active: bool,
     num_mag: i32, // stretched confidence (>=0)
+    cur_col: usize, // column index of the value being read (usize::MAX = none/JSON)
+    // cross-column formula state (CSV/SQL): per-row values + per-column hypothesis
+    row_vals: [i64; MAXCOL],
+    row_has: [bool; MAXCOL],
+    xsrc: [u8; MAXCOL],  // source column this column is predicted from
+    xoff: [i64; MAXCOL], // offset: value = row_vals[src] + xoff
+    xhits: [u32; MAXCOL],
     // mixer (16.16 fixed-point weights, one set per previous byte)
     w: Vec<[i32; NIN]>,
     // cached for update()
@@ -491,6 +499,12 @@ impl Predictor {
             np_ptr: 0,
             np_active: false,
             num_mag: 0,
+            cur_col: usize::MAX,
+            row_vals: [0; MAXCOL],
+            row_has: [false; MAXCOL],
+            xsrc: [0; MAXCOL],
+            xoff: [0; MAXCOL],
+            xhits: [0; MAXCOL],
             w: vec![[init_w; NIN]; 256],
             idx: [0; NTAB],
             st: [0; NIN],
@@ -626,13 +640,35 @@ impl Predictor {
         self.recompute_ctx();
     }
 
-    fn set_np(&mut self, field: u32) {
+    /// Set up the numeric prediction for the value about to be read in `field`
+    /// (column `col`, or usize::MAX for none). Chooses the more confident of two
+    /// hypotheses: cross-row extrapolation (last+delta) or a cross-column relation
+    /// (value = another column in this row + offset).
+    fn set_np(&mut self, field: u32, col: usize) {
         let slot = self.num[(field as usize) & (NUMSLOTS - 1)];
-        if !slot.seen {
+        let ext_ok = slot.seen;
+        let ext_pred = slot.last.wrapping_add(slot.delta);
+        let ext_hits = if ext_ok { slot.hits } else { 0 };
+        // cross-column candidate
+        let mut xc_ok = false;
+        let mut xc_pred = 0i64;
+        let mut xc_hits = 0u32;
+        if col < MAXCOL {
+            let s = self.xsrc[col] as usize;
+            if self.xhits[col] >= 2 && s < MAXCOL && self.row_has[s] {
+                xc_pred = self.row_vals[s].wrapping_add(self.xoff[col]);
+                xc_hits = self.xhits[col];
+                xc_ok = true;
+            }
+        }
+        let (pred, hits) = if xc_ok && (!ext_ok || xc_hits > ext_hits) {
+            (xc_pred, xc_hits)
+        } else if ext_ok {
+            (ext_pred, ext_hits)
+        } else {
             self.np_active = false;
             return;
-        }
-        let pred = slot.last.wrapping_add(slot.delta);
+        };
         let neg = pred < 0;
         let mut x = (pred as i128).unsigned_abs();
         let mut d = [0u8; 24];
@@ -659,7 +695,11 @@ impl Predictor {
         self.np_len = p;
         self.np_ptr = 0;
         self.np_active = true;
-        self.num_mag = self.stretch_tab[conf_prob(slot.hits)];
+        self.num_mag = self.stretch_tab[conf_prob(hits)];
+    }
+
+    fn reset_row(&mut self) {
+        self.row_has = [false; MAXCOL];
     }
 
     fn finalize_numeric(&mut self) {
@@ -667,6 +707,7 @@ impl Predictor {
             return;
         }
         let actual = if self.cur_neg { -self.cur_num } else { self.cur_num };
+        // cross-row (per-field) update
         let i = (self.cur_field as usize) & (NUMSLOTS - 1);
         let slot = self.num[i];
         let predicted = slot.last.wrapping_add(slot.delta);
@@ -681,6 +722,40 @@ impl Predictor {
         ns.last = actual;
         ns.seen = true;
         self.num[i] = ns;
+        // cross-column update: confirm/relearn how this column relates to earlier ones
+        let col = self.cur_col;
+        if col < MAXCOL {
+            let s = self.xsrc[col] as usize;
+            let hyp_ok = self.xhits[col] >= 1
+                && s < col
+                && self.row_has[s]
+                && self.row_vals[s].wrapping_add(self.xoff[col]) == actual;
+            if hyp_ok {
+                self.xhits[col] = (self.xhits[col] + 1).min(255);
+            } else {
+                let mut learned = false;
+                for xcol in 0..col {
+                    if self.row_has[xcol] && self.row_vals[xcol] == actual {
+                        self.xsrc[col] = xcol as u8; // copy: value == another column
+                        self.xoff[col] = 0;
+                        self.xhits[col] = 1;
+                        learned = true;
+                        break;
+                    }
+                }
+                if !learned {
+                    if col >= 1 && self.row_has[col - 1] {
+                        self.xsrc[col] = (col - 1) as u8; // offset from previous column
+                        self.xoff[col] = actual.wrapping_sub(self.row_vals[col - 1]);
+                        self.xhits[col] = 1;
+                    } else {
+                        self.xhits[col] /= 2;
+                    }
+                }
+            }
+            self.row_vals[col] = actual;
+            self.row_has[col] = true;
+        }
     }
 
     #[inline]
@@ -751,6 +826,7 @@ impl Predictor {
                     self.cur_num = 0;
                     self.cur_len = 0;
                     self.cur_field = self.field_hash();
+                    self.cur_col = usize::MAX; // JSON: no cross-column indexing
                     if c != b'-' {
                         self.cur_num = (c - b'0') as i64;
                         self.cur_len = 1;
@@ -785,7 +861,7 @@ impl Predictor {
                 self.stack.push(Frame { is_object: false, key_hash: 0, expect_key: false });
                 self.value_pending = true;
                 let f = self.field_hash();
-                self.set_np(f);
+                self.set_np(f, usize::MAX);
                 self.vpos = 0;
             }
             b'}' | b']' => {
@@ -798,7 +874,7 @@ impl Predictor {
                 }
                 self.value_pending = true;
                 let f = self.field_hash();
-                self.set_np(f);
+                self.set_np(f, usize::MAX);
                 self.vpos = 0;
             }
             b',' => {
@@ -812,7 +888,7 @@ impl Predictor {
                 } else {
                     self.value_pending = true;
                     let f = self.field_hash();
-                    self.set_np(f);
+                    self.set_np(f, usize::MAX);
                 }
                 self.vpos = 0;
             }
@@ -900,6 +976,9 @@ impl Predictor {
                 self.vpos = 0;
             }
             b'(' => {
+                if self.sql_depth == 0 {
+                    self.reset_row(); // a top-level tuple is a new row
+                }
                 if (self.sql_depth as usize) < self.sql_col_stack.len() {
                     self.sql_col_stack[self.sql_depth as usize] = self.sql_col;
                 }
@@ -907,7 +986,8 @@ impl Predictor {
                 self.sql_col = 0;
                 self.sql_value_pending = true;
                 let f = sql_field(self.sql_col, self.sql_depth);
-                self.set_np(f);
+                let col = if self.sql_depth == 1 { self.sql_col as usize } else { usize::MAX };
+                self.set_np(f, col);
                 self.vpos = 0;
             }
             b')' => {
@@ -924,7 +1004,8 @@ impl Predictor {
                 self.sql_col = self.sql_col.wrapping_add(1);
                 self.sql_value_pending = true;
                 let f = sql_field(self.sql_col, self.sql_depth);
-                self.set_np(f);
+                let col = if self.sql_depth == 1 { self.sql_col as usize } else { usize::MAX };
+                self.set_np(f, col);
                 self.vpos = 0;
             }
             b' ' | b'\n' | b'\r' | b'\t' => {
@@ -940,6 +1021,7 @@ impl Predictor {
                         self.cur_num = 0;
                         self.cur_len = 0;
                         self.cur_field = sql_field(self.sql_col, self.sql_depth);
+                        self.cur_col = if self.sql_depth == 1 { self.sql_col as usize } else { usize::MAX };
                         if c != b'-' {
                             self.cur_num = (c - b'0') as i64;
                             self.cur_len = 1;
@@ -1056,11 +1138,12 @@ impl Predictor {
                 self.np_active = false;
                 if c == b'\n' {
                     self.csv_col = 0;
+                    self.reset_row(); // a new line is a new row
                 } else {
                     self.csv_col += 1;
                 }
                 let f = csv_field(self.csv_col);
-                self.set_np(f); // set up prediction for the next column's value
+                self.set_np(f, self.csv_col as usize); // prediction for the next column's value
                 self.csv_value_pending = true;
                 self.vpos = 0;
             }
@@ -1074,6 +1157,7 @@ impl Predictor {
                         self.cur_num = 0;
                         self.cur_len = 0;
                         self.cur_field = csv_field(self.csv_col);
+                        self.cur_col = self.csv_col as usize;
                         if c != b'-' {
                             self.cur_num = (c - b'0') as i64;
                             self.cur_len = 1;
@@ -1376,6 +1460,21 @@ mod tests {
                 if i < 24 { s.push(','); }
             }
             s.push_str(";\n");
+        }
+        roundtrip(s.as_bytes());
+    }
+
+    #[test]
+    fn cross_column_csv() {
+        // col1 = col0 + 500 (offset), col2 = col0 (copy), col0/col3 unpredictable
+        let mut s = String::from("a,b,c,d\n");
+        let mut x: u64 = 12345;
+        for _ in 0..5000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let v = (x % 1_000_000) as i64;
+            s.push_str(&format!("{},{},{},{}\n", v, v + 500, v, (x >> 20) % 97));
         }
         roundtrip(s.as_bytes());
     }
