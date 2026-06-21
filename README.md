@@ -21,6 +21,15 @@ Compression ratio (higher is better), full files, byte-exact lossless:
 
 augur beats `xz -9e` on every dataset tested, and beats `parquet+zstd` (the columnar specialist) on every tabular case where it applies.
 
+### Standard corpora
+
+On the benchmarks the field reports, vs `zstd -19` / `xz -9e` (byte-exact lossless):
+
+- **enwik8** (100 MB, English Wikipedia): augur **4.03x** — matches xz, beats zstd. (A heavy context-mixer like cmix goes further on pure text; augur is a lightweight CM that trades peak ratio for speed and a single small file.)
+- **Silesia** (212 MB, 12 mixed files): augur wins **8 of 13 files** — every text file (dickens, webster, reymont), plus xml, osdb, and *both* medical images (mr +18%, x-ray +15% vs xz). It trails xz on the binaries (mozilla, ooffice, sao) and on nci (extremely repetitive data, where LZMA's long-match parsing wins), so xz narrowly takes the byte-weighted aggregate — which is dominated by those large binary files.
+
+Read: augur is a **text/structured specialist** — it wins most files, decisively on text and structured data, and trails general compressors on binaries and on data with very long exact repeats.
+
 ## Build
 
 ```bash
