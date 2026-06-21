@@ -88,7 +88,7 @@ That single idea pushed gh_events from **18.44x → 20.34x — past xz.** The sa
 generalizes by format: a one-byte header records whether the data is JSON, CSV, or
 generic (sniffed at compress time, read back at decompress, so the parsers never
 collide). The CSV parser exposes the *column index* as the semantic context and
-routes the numeric model per-column — which lifted taxi.csv from 9.32x to **11.11x**,
+routes the numeric model per-column — which lifted taxi.csv from 9.32x to **11.66x**,
 +31% over xz, because columnar numeric data is exactly what byte-LZ handles worst.
 
 Then the categorically-new weapon: a **numeric model** — formula detection in its
@@ -154,6 +154,18 @@ contiguous buffer (no pointer-chasing, no bounds checks on the hot path) and shr
 them to fit cache. Decode got **20–40% faster** for ~2–3% ratio. Encode 4.6–5.5 MB/s,
 decode 3.4–4.1 MB/s now.
 
+## Step 7: sharper matching
+
+Validating on the standard corpora (Silesia, enwik8) exposed one honest weak spot:
+nci, a tiny-alphabet chemical database with *very* long exact repeats, where xz's
+LZMA beat us (23.2x vs 18.3x). The cause: augur had a single match model with one
+6-byte hash keeping only the most recent position, so on highly repetitive data it
+chased short coincidental matches and churned. The fix: **two match models** — a
+short one (6-byte) for fast re-acquisition and a long one (16-byte) that locks onto
+genuine long repeats with far fewer false hits. Pure win, no regressions: nci jumped
+to 19.9x, samba flipped to a win (Silesia went 8→9 of 13 files), and every structured
+dataset ticked up (taxi.csv +5%, taxi.ndjson +2.6%, xml +4%).
+
 ## Results
 
 augur vs the best general-purpose compressors, full files, compression ratio
@@ -161,14 +173,14 @@ augur vs the best general-purpose compressors, full files, compression ratio
 
 | dataset | old Recursor | zstd-19 | xz-9e | parquet+zstd | **augur** |
 |---|---|---|---|---|---|
-| gh_events.ndjson | 5.90x | 16.84x | 19.89x | — | **21.67x** |
-| nginx_logs | 14.65x | 26.54x | 29.32x | 28.29x | **41.79x** |
-| taxi.csv | 5.45x | 8.12x | 8.45x | 6.18x | **11.11x** |
-| taxi.ndjson | 26.12x | 27.98x | 31.84x | 33.50x | **40.53x** |
-| seq.ndjson (synthetic) | — | 11.37x | 15.19x | — | **32.44x** |
-| threats.ndjson (real) | — | 11.71x | 12.76x | — | **15.96x** |
+| gh_events.ndjson | 5.90x | 16.84x | 19.89x | — | **21.99x** |
+| nginx_logs | 14.65x | 26.54x | 29.32x | 28.29x | **41.97x** |
+| taxi.csv | 5.45x | 8.12x | 8.45x | 6.18x | **11.66x** |
+| taxi.ndjson | 26.12x | 27.98x | 31.84x | 33.50x | **41.57x** |
+| seq.ndjson (synthetic) | — | 11.37x | 15.19x | — | **32.46x** |
+| threats.ndjson (real) | — | 11.71x | 12.76x | — | **16.03x** |
 
-augur beats `xz -9e` on **every dataset tested — six for six** — by 9% to 114% —
+augur beats `xz -9e` on **every dataset tested — six for six** — by 11% to 114% —
 and beats `parquet+zstd`, the columnar specialist, on every tabular case where it
 applies. Every output is **byte-exact lossless** (verified roundtrip on every run).
 

@@ -143,8 +143,10 @@ const MASK: usize = (1 << MEM_BITS) - 1;
 const NORD: usize = 5;
 const NSTR: usize = 2;
 const NTAB: usize = NORD + NSTR;
-const NIN: usize = NTAB + 2; // + match + numeric
+const NMATCH: usize = 2; // match models: short-context (fast reacquire) + long (locks long repeats)
+const NIN: usize = NTAB + NMATCH + 1; // table models + match models + numeric
 const MINLEN: usize = 6;
+const MINLEN_LONG: usize = 16;
 const RATE: i32 = 4;
 const LR: i32 = 7; // mixer learning rate (lpaq-style)
 const ARRAY_TAG: u32 = 0xA22A_5151;
@@ -241,22 +243,86 @@ struct NumState {
     seen: bool,
 }
 
+/// A match-model predictor: finds where the current `minlen`-byte context last
+/// occurred and predicts that the following bytes will repeat. A longer `minlen`
+/// finds longer, more reliable repeats (fewer hash collisions); a shorter one
+/// re-acquires faster. The prediction strength grows with the run length.
+struct MatchModel {
+    table: Vec<u32>, // context hash -> position of the byte that followed last time
+    minlen: usize,
+    on: bool,
+    ptr: usize, // position in buf of the predicted next byte
+    len: u32,   // current match run length (confidence)
+    pb: u8,     // predicted byte
+    mag: i32,   // stretched confidence magnitude, recomputed at byte boundary
+}
+
+impl MatchModel {
+    fn new(minlen: usize) -> Self {
+        Self { table: vec![0u32; 1 << MEM_BITS], minlen, on: false, ptr: 0, len: 0, pb: 0, mag: 0 }
+    }
+
+    /// Per-bit stretched contribution for the mixer (0 when off or off-track).
+    #[inline]
+    fn stretch_for(&self, c0: u32, bitpos: u32) -> i32 {
+        if !self.on {
+            return 0;
+        }
+        let placed = c0 - (1 << bitpos);
+        if bitpos == 0 || placed == (self.pb as u32 >> (8 - bitpos)) {
+            if (self.pb >> (7 - bitpos)) & 1 == 1 { self.mag } else { -self.mag }
+        } else {
+            0
+        }
+    }
+
+    /// Advance the model at a byte boundary. `buf` already includes `byte`.
+    fn update(&mut self, buf: &[u8], byte: u8, stretch_tab: &[i32]) {
+        let n = buf.len();
+        if self.on && buf[self.ptr] == byte {
+            self.ptr += 1;
+            self.len += 1;
+            if self.ptr >= n {
+                self.on = false;
+                self.len = 0;
+            }
+        } else {
+            self.on = false;
+            self.len = 0;
+        }
+        if n >= self.minlen {
+            let h = hash_n(buf, n, self.minlen) as usize & MASK;
+            if !self.on {
+                let cand = self.table[h] as usize;
+                if cand != 0 && cand < n {
+                    self.ptr = cand;
+                    self.on = true;
+                    self.len = 0;
+                }
+            }
+            self.table[h] = n as u32;
+        }
+        if self.on && self.ptr < n {
+            self.pb = buf[self.ptr];
+            self.mag = stretch_tab[conf_prob(self.len)];
+        } else {
+            self.on = false;
+            self.mag = 0;
+        }
+    }
+}
+
 struct Predictor {
     buf: Vec<u8>,
     t: Vec<u16>, // NTAB context tables, flattened: model m occupies [m<<MEM_BITS ..]
-    mm: Vec<u32>,
     stretch_tab: Vec<i32>,
     squash_tab: Vec<i32>,
     // bit-assembly state
     c0: u32,
     bitpos: u32,
     ctxh: [u32; NTAB],
-    // match model
-    mm_on: bool,
-    match_ptr: usize,
-    match_len: u32,
-    pb: u8,
-    match_mag: i32, // stretched confidence (>=0), recomputed at byte boundary
+    // match models (short + long context)
+    matches: Vec<MatchModel>,
     // streaming JSON parser
     in_str: bool,
     esc: bool,
@@ -298,17 +364,12 @@ impl Predictor {
         let mut p = Self {
             buf: Vec::new(),
             t: vec![2048u16; NTAB << MEM_BITS],
-            mm: vec![0u32; 1 << MEM_BITS],
             stretch_tab: build_stretch(),
             squash_tab: build_squash(),
             c0: 1,
             bitpos: 0,
             ctxh: [0; NTAB],
-            mm_on: false,
-            match_ptr: 0,
-            match_len: 0,
-            pb: 0,
-            match_mag: 0,
+            matches: vec![MatchModel::new(MINLEN), MatchModel::new(MINLEN_LONG)],
             in_str: false,
             esc: false,
             str_is_key: false,
@@ -387,16 +448,10 @@ impl Predictor {
             let tv = unsafe { *self.t.get_unchecked(flat) } as usize;
             self.st[m] = unsafe { *self.stretch_tab.get_unchecked(tv & 4095) };
         }
-        // match model: ± precomputed confidence depending on the predicted bit
-        let mut sm = 0;
-        if self.mm_on {
-            let bp = self.bitpos;
-            let placed = self.c0 - (1 << bp);
-            if bp == 0 || placed == (self.pb as u32 >> (8 - bp)) {
-                sm = if (self.pb >> (7 - bp)) & 1 == 1 { self.match_mag } else { -self.match_mag };
-            }
+        // match models
+        for i in 0..NMATCH {
+            self.st[NTAB + i] = self.matches[i].stretch_for(self.c0, self.bitpos);
         }
-        self.st[NTAB] = sm;
         // numeric model
         let mut sn = 0;
         if self.np_active && self.np_ptr < self.np_len {
@@ -407,7 +462,7 @@ impl Predictor {
                 sn = if (pbn >> (7 - bp)) & 1 == 1 { self.num_mag } else { -self.num_mag };
             }
         }
-        self.st[NTAB + 1] = sn;
+        self.st[NTAB + NMATCH] = sn;
 
         // mix: dot product in 16.16 fixed-point
         self.wsel = *self.buf.last().unwrap_or(&0) as usize;
@@ -449,39 +504,10 @@ impl Predictor {
     }
 
     fn byte_boundary(&mut self, byte: u8) {
-        // --- match model ---
-        let predicted_ok = self.mm_on && self.buf[self.match_ptr] == byte;
+        // --- match models ---
         self.buf.push(byte);
-        let n = self.buf.len();
-        if predicted_ok {
-            self.match_ptr += 1;
-            self.match_len += 1;
-            if self.match_ptr >= n {
-                self.mm_on = false;
-                self.match_len = 0;
-            }
-        } else {
-            self.mm_on = false;
-            self.match_len = 0;
-        }
-        if n >= MINLEN {
-            let hh = hash_n(&self.buf, n, MINLEN) as usize & MASK;
-            if !self.mm_on {
-                let cand = self.mm[hh] as usize;
-                if cand != 0 && cand < n {
-                    self.match_ptr = cand;
-                    self.mm_on = true;
-                    self.match_len = 0;
-                }
-            }
-            self.mm[hh] = n as u32;
-        }
-        if self.mm_on && self.match_ptr < self.buf.len() {
-            self.pb = self.buf[self.match_ptr];
-            self.match_mag = self.stretch_tab[conf_prob(self.match_len)];
-        } else {
-            self.mm_on = false;
-            self.match_mag = 0;
+        for m in &mut self.matches {
+            m.update(&self.buf, byte, &self.stretch_tab);
         }
 
         // --- structure + numeric model (format-aware) ---

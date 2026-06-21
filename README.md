@@ -12,12 +12,12 @@ Compression ratio (higher is better), full files, byte-exact lossless:
 
 | dataset | zstd-19 | xz-9e | parquet+zstd | **augur** | vs xz |
 |---|---|---|---|---|---|
-| gh_events.ndjson | 16.84x | 19.89x | — | **21.67x** | +9% |
-| nginx_logs | 26.54x | 29.32x | 28.29x | **41.79x** | +43% |
-| taxi.csv | 8.12x | 8.45x | 6.18x | **11.11x** | +31% |
-| taxi.ndjson | 27.98x | 31.84x | 33.50x | **40.53x** | +27% |
-| threats.ndjson (real DB export) | 11.71x | 12.76x | — | **15.96x** | +25% |
-| seq.ndjson (sequential IDs/timestamps) | 11.37x | 15.19x | — | **32.44x** | +114% |
+| gh_events.ndjson | 16.84x | 19.89x | — | **21.99x** | +11% |
+| nginx_logs | 26.54x | 29.32x | 28.29x | **41.97x** | +43% |
+| taxi.csv | 8.12x | 8.45x | 6.18x | **11.66x** | +38% |
+| taxi.ndjson | 27.98x | 31.84x | 33.50x | **41.57x** | +31% |
+| threats.ndjson (real DB export) | 11.71x | 12.76x | — | **16.03x** | +26% |
+| seq.ndjson (sequential IDs/timestamps) | 11.37x | 15.19x | — | **32.46x** | +114% |
 
 augur beats `xz -9e` on every dataset tested, and beats `parquet+zstd` (the columnar specialist) on every tabular case where it applies.
 
@@ -26,7 +26,7 @@ augur beats `xz -9e` on every dataset tested, and beats `parquet+zstd` (the colu
 On the benchmarks the field reports, vs `zstd -19` / `xz -9e` (byte-exact lossless):
 
 - **enwik8** (100 MB, English Wikipedia): augur **4.03x** — matches xz, beats zstd. (A heavy context-mixer like cmix goes further on pure text; augur is a lightweight CM that trades peak ratio for speed and a single small file.)
-- **Silesia** (212 MB, 12 mixed files): augur wins **8 of 13 files** — every text file (dickens, webster, reymont), plus xml, osdb, and *both* medical images (mr +18%, x-ray +15% vs xz). It trails xz on the binaries (mozilla, ooffice, sao) and on nci (extremely repetitive data, where LZMA's long-match parsing wins), so xz narrowly takes the byte-weighted aggregate — which is dominated by those large binary files.
+- **Silesia** (212 MB, 12 mixed files): augur wins **9 of 13 files** — every text file (dickens, webster, reymont), plus xml, osdb, samba, and *both* medical images (mr +18%, x-ray +15% vs xz). It trails xz on the binaries (mozilla, ooffice, sao) and on nci (extremely repetitive data where LZMA's long-match parsing wins — augur's dual match models narrow it to 19.9x vs 23.2x), so xz still narrowly takes the byte-weighted aggregate, which is dominated by those large binary files.
 
 Read: augur is a **text/structured specialist** — it wins most files, decisively on text and structured data, and trails general compressors on binaries and on data with very long exact repeats.
 

@@ -1,0 +1,86 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../augur-${{ matrix.target }}.tar.gz augur
+
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../augur-${{ matrix.target }}.zip augur.exe
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: augur-${{ matrix.target }}.*
+          fail_on_unmatched_files: true
+          make_latest: true
+          body: |
+            **augur v0.1.0** — structure-aware lossless compressor that beats `xz -9e` on structured data by predicting, not packing.
+
+            Beats `xz -9e` on every dataset tested (byte-exact lossless):
+
+            | dataset | xz-9e | augur |
+            |---|---|---|
+            | taxi.csv | 8.45x | **11.11x** |
+            | nginx_logs | 29.32x | **41.79x** |
+            | gh_events.ndjson | 19.89x | **21.67x** |
+            | taxi.ndjson | 31.84x | **40.53x** |
+            | seq.ndjson (sequential IDs) | 15.19x | **32.44x** |
+
+            ### Install
+            Download the binary for your platform below, or build from source:
+            ```
+            cargo build --release
+            ```
+
+            ### Usage
+            ```
+            augur compress   data.ndjson            # -> data.ndjson.augur
+            augur decompress data.ndjson.augur      # -> restores the original
+            augur bench      data.csv               # compress + verify + time
+            ```
+
+            Strongest on structured data (JSON/NDJSON/CSV/logs/DB exports) and text. See the README for honest boundaries (it trails `xz` on binaries, and decode is slower than zstd/xz — ideal for write-once/read-rarely data).
