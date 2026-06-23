@@ -177,6 +177,19 @@ Evil-DB threats exported as SQL): augur **9.01x** vs xz 7.25x, zstd 6.72x — **
 over xz**. Format is auto-sniffed and recorded in the header, so the decoder uses the
 same parser; roundtrip byte-exact.
 
+## Step 9: chains, XML, and cross-column relations
+
+Three more, in one push. **Hash-chain matching**: each match model now walks a
+chain of recent positions and picks the candidate whose preceding bytes match the
+current context longest (a fresh match stays cautious so it can't override the
+structure models) — closing the nci gap and lifting text across the board.
+**XML/HTML mode**: a tag parser exposing the current element as semantic context —
+**+25% over xz** on real XML. And the categorically-new one, **cross-column formula
+detection**: the numeric model now predicts a column from *another column in the
+same row* — a copy (`lastSeen = firstSeen`) or constant offset (`id = seq +
+100000`) — choosing whichever beats plain row-extrapolation. On data with such
+relations, **+64% over xz**, capturing structure no byte-level coder can see.
+
 ## Results
 
 augur vs the best general-purpose compressors, full files, compression ratio
@@ -184,15 +197,17 @@ augur vs the best general-purpose compressors, full files, compression ratio
 
 | dataset | old Recursor | zstd-19 | xz-9e | parquet+zstd | **augur** |
 |---|---|---|---|---|---|
-| gh_events.ndjson | 5.90x | 16.84x | 19.89x | — | **21.99x** |
-| nginx_logs | 14.65x | 26.54x | 29.32x | 28.29x | **41.97x** |
-| taxi.csv | 5.45x | 8.12x | 8.45x | 6.18x | **11.66x** |
-| taxi.ndjson | 26.12x | 27.98x | 31.84x | 33.50x | **41.57x** |
-| seq.ndjson (synthetic) | — | 11.37x | 15.19x | — | **32.46x** |
-| threats.ndjson (real) | — | 11.71x | 12.76x | — | **16.03x** |
-| threats.sql (real DB dump) | — | 6.72x | 7.25x | — | **9.01x** |
+| gh_events.ndjson | 5.90x | 16.84x | 19.89x | — | **22.31x** |
+| nginx_logs | 14.65x | 26.54x | 29.32x | 28.29x | **41.89x** |
+| taxi.csv | 5.45x | 8.12x | 8.45x | 6.18x | **11.62x** |
+| taxi.ndjson | 26.12x | 27.98x | 31.84x | 33.50x | **42.67x** |
+| seq.ndjson (synthetic) | — | 11.37x | 15.19x | — | **32.41x** |
+| threats.ndjson (real) | — | 11.71x | 12.76x | — | **16.09x** |
+| threats.sql (real DB dump) | — | 6.72x | 7.25x | — | **9.05x** |
+| threats.xml (real DB as XML) | — | 13.73x | 15.37x | — | **19.28x** |
+| xcol.csv (cross-column) | — | 3.31x | 4.10x | — | **6.74x** |
 
-augur beats `xz -9e` on **every dataset tested — seven for seven** — by 11% to 114% —
+augur beats `xz -9e` on **every dataset tested — nine for nine** — by 12% to 113% —
 and beats `parquet+zstd`, the columnar specialist, on every tabular case where it
 applies. Every output is **byte-exact lossless** (verified roundtrip on every run).
 
@@ -219,6 +234,7 @@ hidden.
 
 One engine. Understand the data, then the small size follows. That's the bet.
 
-*Built in a day. From a 32k-line project that lost to zstd, to a ~700-line one that
-beats xz by 11–114% on six datasets — including 7.8M real threats — at competitive
-encode speed.*
+*From a 32k-line project that lost to zstd, to a ~1k-line one that beats xz by
+12–113% on nine datasets — including a real 7.8M-row threat database in NDJSON, SQL,
+and XML form — understanding five formats and predicting both across rows and across
+columns.*

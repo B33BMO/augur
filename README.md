@@ -2,9 +2,9 @@
 
 **A structure-aware, lossless compressor that beats `xz -9e` by understanding your data instead of just packing bytes.**
 
-augur is a from-scratch context-mixing compressor built on one idea: **compression is prediction.** Predict the next bit, code only the surprise. A logistic mixer blends a portfolio of predictors — local context, long-range matches, and *structure-aware* models that understand JSON fields, CSV columns, and SQL-dump tuples — feeding a single arithmetic coder. The encoder and decoder run the identical predict→code→update loop, so they can never desync.
+augur is a from-scratch context-mixing compressor built on one idea: **compression is prediction.** Predict the next bit, code only the surprise. A logistic mixer blends a portfolio of predictors — local context, long-range hash-chain matches, *structure-aware* models that understand JSON fields, CSV columns, SQL-dump tuples and XML elements, and a numeric model that learns both sequential and **cross-column** relationships (`lastSeen = firstSeen`, `id = seq + 100000`) — feeding a single arithmetic coder. The encoder and decoder run the identical predict→code→update loop, so they can never desync.
 
-It has **zero dependencies** (not even for the CLI) and is a single ~830-line Rust file.
+It has **zero dependencies** (not even for the CLI) and is a single Rust file.
 
 ## Results
 
@@ -12,13 +12,15 @@ Compression ratio (higher is better), full files, byte-exact lossless:
 
 | dataset | zstd-19 | xz-9e | parquet+zstd | **augur** | vs xz |
 |---|---|---|---|---|---|
-| gh_events.ndjson | 16.84x | 19.89x | — | **21.99x** | +11% |
-| nginx_logs | 26.54x | 29.32x | 28.29x | **41.97x** | +43% |
-| taxi.csv | 8.12x | 8.45x | 6.18x | **11.66x** | +38% |
-| taxi.ndjson | 27.98x | 31.84x | 33.50x | **41.57x** | +31% |
-| threats.ndjson (real DB export) | 11.71x | 12.76x | — | **16.03x** | +26% |
-| threats.sql (real DB dump) | 6.72x | 7.25x | — | **9.01x** | +24% |
-| seq.ndjson (sequential IDs/timestamps) | 11.37x | 15.19x | — | **32.46x** | +114% |
+| gh_events.ndjson | 16.84x | 19.89x | — | **22.31x** | +12% |
+| nginx_logs | 26.54x | 29.32x | 28.29x | **41.89x** | +43% |
+| taxi.csv | 8.12x | 8.45x | 6.18x | **11.62x** | +37% |
+| taxi.ndjson | 27.98x | 31.84x | 33.50x | **42.67x** | +34% |
+| threats.ndjson (real DB export) | 11.71x | 12.76x | — | **16.09x** | +26% |
+| threats.sql (real DB dump) | 6.72x | 7.25x | — | **9.05x** | +25% |
+| threats.xml (real DB as XML) | 13.73x | 15.37x | — | **19.28x** | +25% |
+| seq.ndjson (sequential IDs/timestamps) | 11.37x | 15.19x | — | **32.41x** | +113% |
+| xcol.csv (cross-column relations) | 3.31x | 4.10x | — | **6.74x** | +64% |
 
 augur beats `xz -9e` on every dataset tested, and beats `parquet+zstd` (the columnar specialist) on every tabular case where it applies.
 
@@ -26,8 +28,8 @@ augur beats `xz -9e` on every dataset tested, and beats `parquet+zstd` (the colu
 
 On the benchmarks the field reports, vs `zstd -19` / `xz -9e` (byte-exact lossless):
 
-- **enwik8** (100 MB, English Wikipedia): augur **4.03x** — matches xz, beats zstd. (A heavy context-mixer like cmix goes further on pure text; augur is a lightweight CM that trades peak ratio for speed and a single small file.)
-- **Silesia** (212 MB, 12 mixed files): augur wins **9 of 13 files** — every text file (dickens, webster, reymont), plus xml, osdb, samba, and *both* medical images (mr +18%, x-ray +15% vs xz). It trails xz on the binaries (mozilla, ooffice, sao) and on nci (extremely repetitive data where LZMA's long-match parsing wins — augur's dual match models narrow it to 19.9x vs 23.2x), so xz still narrowly takes the byte-weighted aggregate, which is dominated by those large binary files.
+- **enwik8** (100 MB, English Wikipedia): augur **4.14x** — beats both xz (4.03x) and zstd. (A heavy context-mixer like cmix goes further on pure text; augur is a lightweight CM that trades peak ratio for speed and a single small file.)
+- **Silesia** (212 MB, 12 mixed files): augur wins **9 of 13 files** — every text file (dickens, webster, reymont), plus xml, osdb, samba, and *both* medical images (mr +18%, x-ray +15% vs xz). It trails xz on the binaries (mozilla, ooffice, sao) and on nci (extremely repetitive data where LZMA's long-match parsing wins — augur's hash-chain match models narrow it to 20.8x vs 23.2x), so xz still narrowly takes the byte-weighted aggregate, which is dominated by those large binary files.
 
 Read: augur is a **text/structured specialist** — it wins most files, decisively on text and structured data, and trails general compressors on binaries and on data with very long exact repeats.
 
@@ -60,9 +62,9 @@ Every model is a `predict()` returning P(next bit = 1). A logistic mixer combine
 The portfolio:
 
 - **Order 0–4 context models** — local byte statistics.
-- **Match model** — long-range repeats, the redundancy a local model structurally cannot see (and the main reason general LZ compressors win on structured data).
-- **Structure models** — a streaming, format-aware parser exposes *semantic position*: which JSON field's value, which CSV column, or which SQL `INSERT ... VALUES` tuple column you're currently inside. Byte-level coders can't condition on "I'm reading the value of `created_at`"; augur can. The format (JSON / CSV / SQL / generic) is sniffed at compress time and recorded in a one-byte header, so the decoder configures the same parser.
-- **Numeric model** — per-field linear extrapolation. For each field it tracks the last value and delta and predicts the digits of `last + delta` *before reading them*. Auto-increment IDs, timestamps, and counters collapse to near-zero bits. When a field isn't predictable, the mixer simply learns to ignore it.
+- **Match models (hash chains)** — long-range repeats, the redundancy a local model structurally cannot see. On a miss, each model walks a chain of recent positions sharing the current context and picks the one whose *preceding* bytes match longest — locking onto genuine long repeats instead of the most-recent coincidence.
+- **Structure models** — a streaming, format-aware parser exposes *semantic position*: which JSON field's value, which CSV column, which SQL `INSERT ... VALUES` tuple column, or which XML element you're currently inside. Byte-level coders can't condition on "I'm reading the value of `created_at`"; augur can. The format (JSON / CSV / SQL / XML / generic) is sniffed at compress time and recorded in a one-byte header, so the decoder configures the same parser.
+- **Numeric model** — predicts the digits of a value *before reading them*, choosing the more confident of two hypotheses: cross-row extrapolation (`last + delta` — auto-increment IDs, timestamps, counters) or a **cross-column** relation within the same row (a copy like `lastSeen = firstSeen`, or a constant offset like `id = seq + 100000`). When neither is predictable, the mixer simply learns to ignore it.
 
 ### Container format
 
