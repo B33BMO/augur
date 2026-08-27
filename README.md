@@ -122,16 +122,36 @@ Table size is chosen from the input length and recorded in the header, so a smal
 
 ## Honest caveats
 
-- **It is slow: roughly 0.4–0.6 MB/s each way.** Context mixing is symmetric and serial — every bit must be predicted before the next can be coded, and augur consults nineteen models, four mixers and four SSE stages per bit. Encode and decode cost about the same, and both are orders of magnitude below zstd/xz. This buys the ratios above; it is the wrong tool for anything latency-sensitive, and the right one for **write-once, read-rarely** data: archival, cold feeds, backups, long-tail object storage.
+- **It is slow: roughly 0.5–0.6 MB/s each way.** Context mixing is symmetric and serial — every bit must be predicted before the next can be coded, and augur consults nineteen models, four mixers and four SSE stages per bit. Encode and decode cost about the same, and both are orders of magnitude below zstd/xz. This buys the ratios above; it is the wrong tool for anything latency-sensitive, and the right one for **write-once, read-rarely** data: archival, cold feeds, backups, long-tail object storage.
 - **Memory is ~120 MB** for inputs above a megabyte, scaled down for smaller ones and recorded in the header so the decoder matches.
 - **On already-compressed or random data there is nothing to model** — augur correctly punts to ~1.0x plus a 16-byte header rather than expanding meaningfully.
 - **The ratio is not the theoretical ceiling.** Heavyweight mixers (cmix, paq8) go substantially further on text by spending thousands of times more compute. augur aims to be the best compressor you'd actually run on structured data, not the winner of an unconstrained ratio contest.
 
 ## Where the speed went
 
-augur used to encode at ~5 MB/s. The models added since cost about 10x that, and the obvious cache fix — packing each nibble's counters into one cache line — was measured and **rejected**: it bought +55% speed for −6.6% ratio, because at fixed memory the buckets cost four bits of context resolution. 16-bit counters were ratio-neutral and halved memory, so those stayed.
+augur used to encode at ~5 MB/s; the models added since cost roughly 10x that.
+Some of it has been clawed back **without giving up a single byte of ratio** —
+the optimisations below leave the compressed output bit-identical:
 
-The next real speed lever is converting mixer weights to `i16` so the dot products vectorise. That is worth roughly 2–3x and costs no ratio in principle, but it needs the learning rate retuned.
+- **Prefetching the next bit's table lines** (+23%). The fifteen scattered loads
+  per bit dominate the inner loop, and their addresses are known one bit early:
+  the next partial byte can only be `c0<<1` or `c0<<1|1`. Both are requested
+  before the mixer and coder run, which covers most of the latency.
+- **Hoisting the `OnceLock` table derefs** out of the per-bit path (+9%). An
+  atomic load and a branch, paid ~28 times per bit, for pointers that never change.
+- **A density pre-check before the E8E9 trial.** Deciding whether the transform
+  pays costs two sample encodes; prose contains essentially no `0xE8` bytes, so
+  it can be rejected in one linear scan instead.
+
+Two things were measured and **rejected**:
+
+- **Nibble-bucketed counter tables**, the textbook cache fix: +55% speed for
+  −6.6% ratio, because at fixed memory the buckets spend four bits of context
+  resolution to buy locality. Wrong trade for this project.
+- **`i16` mixer weights for SIMD.** Removing three of the four layer-1 mixers
+  entirely only saved 11% wall-clock, so the whole mixer is ~15% of runtime and
+  vectorising it caps out around 8% — not worth the retuning risk. The bottleneck
+  is memory, not arithmetic.
 
 ## Testing
 

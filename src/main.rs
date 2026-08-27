@@ -447,11 +447,12 @@ struct TrustMap {
     t: Vec<u32>,
     idx: usize,
     active: bool,
+    stab: &'static [i32],
 }
 
 impl TrustMap {
     fn new() -> Self {
-        Self { t: vec![TRUST_INIT; TRUST_CTX], idx: 0, active: false }
+        Self { t: vec![TRUST_INIT; TRUST_CTX], idx: 0, active: false, stab: stretch_tab() }
     }
 
     /// Stretched P(bit==1) given the oracle's state; remembers the cell to train.
@@ -460,7 +461,7 @@ impl TrustMap {
         self.idx = cx & (TRUST_CTX - 1);
         self.active = true;
         // SAFETY: idx is masked into range; ctr_p12 < 4096 = stretch_tab.len()
-        unsafe { *stretch_tab().get_unchecked(wide_p12(*self.t.get_unchecked(self.idx))) }
+        unsafe { *self.stab.get_unchecked(wide_p12(*self.t.get_unchecked(self.idx))) }
     }
 
     /// The oracle had nothing to say this bit, so there is nothing to learn.
@@ -692,6 +693,29 @@ impl MatchModel {
     }
 }
 
+/// Ask the CPU to start fetching a line we are about to need.
+///
+/// The inner loop's cost is dominated by fifteen scattered loads per bit into a
+/// table far larger than cache. Those addresses are known one bit early — the
+/// next partial byte can only be `c0<<1` or `c0<<1|1` — so both can be requested
+/// before the mixer, the SSE chain and the coder run, which is enough work to
+/// cover most of the latency. Purely a scheduling hint: it changes no output.
+#[inline(always)]
+fn prefetch(p: *const u16) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = p;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SSE / APM — secondary symbol estimation.
 //
@@ -708,6 +732,7 @@ struct Apm {
     t: Vec<u16>, // (context, bucket) -> refined probability, 16-bit
     idx: usize,  // cell touched by the last refine(), updated on the next bit
     mask: usize,
+    stab: &'static [i32],
 }
 
 impl Apm {
@@ -723,14 +748,14 @@ impl Apm {
                 t[i * 33 + j] = v;
             }
         }
-        Self { t, idx: 0, mask: n - 1 }
+        Self { t, idx: 0, mask: n - 1, stab: stretch_tab() }
     }
 
     #[inline]
     fn refine(&mut self, pr: i32, cx: usize) -> i32 {
         // SAFETY: pr is clamped to 1..4095 by every caller; s lands in 1..4095 so
         // (s>>7) is 0..31 and i+1 stays inside the context's 33-bucket row.
-        let s = unsafe { *stretch_tab().get_unchecked(pr as usize) } + 2048;
+        let s = unsafe { *self.stab.get_unchecked(pr as usize) } + 2048;
         let w = s & 127;
         let i = (s >> 7) as usize + (cx & self.mask) * 33;
         self.idx = i + (w >> 6) as usize;
@@ -768,12 +793,13 @@ struct Mixer<const N: usize> {
     w: Vec<i32>, // nsets * N weights, 16.16 fixed point
     mask: usize,
     sel: usize, // offset of the weight set used by the last mix()
+    sqtab: &'static [i32],
 }
 
 impl<const N: usize> Mixer<N> {
     fn new(bits: usize) -> Self {
         let nsets = 1usize << bits;
-        Self { w: vec![(1i32 << 16) / N as i32; nsets * N], mask: nsets - 1, sel: 0 }
+        Self { w: vec![(1i32 << 16) / N as i32; nsets * N], mask: nsets - 1, sel: 0, sqtab: squash_tab() }
     }
 
     /// Blend `st` under weight set `ctx`; returns the stretched prediction.
@@ -792,7 +818,8 @@ impl<const N: usize> Mixer<N> {
     /// Gradient step on the weight set that produced `out`.
     #[inline]
     fn update(&mut self, st: &[i32; N], out: i32, bit: u32) {
-        let err = (((bit as i32) << 12) - squash(out)) * LR;
+        let sq = unsafe { *self.sqtab.get_unchecked((out.clamp(ST_MIN, ST_MAX) + 2048) as usize) };
+        let err = (((bit as i32) << 12) - sq) * LR;
         // SAFETY: sel was set by the matching mix() call
         let w = unsafe { self.w.get_unchecked_mut(self.sel..self.sel + N) };
         for i in 0..N {
@@ -1052,13 +1079,32 @@ impl Predictor {
 
     #[inline]
     fn predict(&mut self) -> u32 {
+        let stab = stretch_tab();
         for m in 0..NTAB {
             let local = (self.ctxh[m] ^ self.c0.wrapping_mul(2_654_435_761)) as usize & self.mask;
             let flat = (m << self.mem_bits) | local; // local < 2^mem_bits, so this is m*stride+local
             self.idx[m] = flat;
             // SAFETY: flat < NTAB<<mem_bits = t.len(); ctr_p12 < 4096 = stretch_tab.len()
             let tv = unsafe { *self.t.get_unchecked(flat) };
-            self.st[m] = unsafe { *stretch_tab().get_unchecked(ctr_p12(tv)) };
+            self.st[m] = unsafe { *stab.get_unchecked(ctr_p12(tv)) };
+        }
+        // Start both candidate loads for the next bit. Skipped on the last bit of
+        // a byte, where the byte boundary rewrites every context hash and the
+        // addresses are not yet knowable.
+        if self.c0 < 128 {
+            let base = self.t.as_ptr();
+            let (n0, n1) = (self.c0 << 1, (self.c0 << 1) | 1);
+            for m in 0..NTAB {
+                let stride = m << self.mem_bits;
+                let h0 = (self.ctxh[m] ^ n0.wrapping_mul(2_654_435_761)) as usize & self.mask;
+                let h1 = (self.ctxh[m] ^ n1.wrapping_mul(2_654_435_761)) as usize & self.mask;
+                // SAFETY: both offsets are < NTAB<<mem_bits = t.len(); prefetch of
+                // an in-bounds address has no architectural effect regardless.
+                unsafe {
+                    prefetch(base.add(stride | h0));
+                    prefetch(base.add(stride | h1));
+                }
+            }
         }
         // Oracles: each names an expected bit; a TrustMap turns that into a
         // probability whose confidence was learned from how often this oracle has
@@ -1960,6 +2006,15 @@ fn e8e9(data: &mut [u8], forward: bool) {
 fn e8e9_helps(data: &[u8], mode: Mode) -> bool {
     const SAMPLE: usize = 192 * 1024;
     if data.len() < SAMPLE * 2 {
+        return false;
+    }
+    // The trial costs two sample encodes, which is real time to spend on a file
+    // that was never going to hold machine code. Prose contains essentially no
+    // 0xE8 bytes at all, while anything binary — code or not — carries them at
+    // roughly 1-in-256 simply by chance. One in 2000 sits far below that and far
+    // below any real instruction stream, so this only rejects text.
+    let e8 = data.iter().filter(|&&b| b == 0xe8).count();
+    if e8.saturating_mul(2000) < data.len() {
         return false;
     }
     // sample from the middle: archives tend to open with headers and metadata
