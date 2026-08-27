@@ -178,7 +178,7 @@ fn build_squash() -> Vec<i32> {
 /// tables cost real ratio, so the cap is generous — but there is no point
 /// allocating 200 MB of slots for a 4 KB input that can never touch them.
 const MEM_BITS_MIN: usize = 16;
-const MEM_BITS_MAX: usize = 22;
+const MEM_BITS_MAX: usize = 23;
 
 fn mem_bits_for(len: usize) -> usize {
     let bl = usize::BITS - len.max(1).leading_zeros(); // ceil-ish log2
@@ -190,7 +190,7 @@ fn mem_bits_for(len: usize) -> usize {
 const ORDERS: [usize; 6] = [1, 2, 3, 4, 6, 8];
 const NORD: usize = 1 + ORDERS.len();
 const NWORD: usize = 2; // word model + (previous word, word) model
-const NSTR: usize = 2;
+const NSTR: usize = 3;
 const NBIN: usize = 4; // 2 record-stride + 2 sparse contexts
 const NTAB: usize = NORD + NWORD + NSTR + NBIN;
 const WORD0: usize = NORD; // first word-model slot in ctxh
@@ -201,9 +201,9 @@ const NREC: usize = 1; // record-history model
 const NIN: usize = NTAB + NMATCH + NREC + 1; // tables + match + record + numeric
 const MINLEN: usize = 6;
 const MINLEN_LONG: usize = 16;
-const CLIMIT: u16 = 12; // counter saturation: caps the slowest adaptation rate
+const CLIMIT: u16 = 8; // counter saturation: caps the slowest adaptation rate
 const LR: i32 = 15; // mixer learning rate (retuned for the two-layer mixer)
-const APM_RATE: i32 = 7; // SSE adaptation shift
+const APM_RATE: i32 = 8; // SSE adaptation shift
 const NMIX: usize = 4; // layer-1 mixers, one per selector view
 /// log2(weight sets) for each layer-1 mixer: partial byte, previous byte,
 /// match-state x bit position, structure context.
@@ -372,6 +372,10 @@ fn hash_n(buf: &[u8], n: usize, k: usize) -> u32 {
 // ---------------------------------------------------------------------------
 
 const CTR_INIT: u16 = 2048 << 4; // p = 1/2, unseen
+
+// The hit count lives in the low 4 bits of a 16-bit counter, so a limit above 15
+// would let the count overflow into the probability field and corrupt it.
+const _: () = assert!(CLIMIT <= 15, "CLIMIT must fit the 4-bit count field");
 
 /// RATE_TAB[n] = 65536 / (n + 1.5), i.e. the 16.16 fixed-point step fraction.
 static RATE_TAB: [i32; 1024] = build_rate_tab();
@@ -578,8 +582,8 @@ struct NumState {
     seen: bool,
 }
 
-const MAX_CHAIN: usize = 8; // hash-chain candidates examined per acquire
-const MAX_BACK: usize = 64; // backward context bytes compared to rank candidates
+const MAX_CHAIN: usize = 4; // hash-chain candidates examined per acquire
+const MAX_BACK: usize = 32; // backward context bytes compared to rank candidates
 
 /// How far back the bytes before `cand` match the bytes before `cur` (capped).
 #[inline]
@@ -1072,6 +1076,11 @@ impl Predictor {
         self.ctxh[STR0] = field
             ^ self.vpos.wrapping_mul(0x85eb_ca6b)
             ^ in_val_str.wrapping_mul(0xc2b2_ae35);
+        // field identity crossed with the two bytes just read: "inside created_at,
+        // having just seen `20`" is far more specific than either half alone
+        let p2 = if n >= 2 { self.buf[n - 2] as u32 } else { 0 };
+        self.ctxh[STR0 + 2] =
+            field.wrapping_mul(0x7feb_352d) ^ (last | (p2 << 8)).wrapping_mul(0x846c_a68b);
         self.ctxh[STR0 + 1] = field.wrapping_mul(0x9e37_79b1)
             ^ aux.wrapping_mul(0x27d4_eb2f)
             ^ last.wrapping_mul(0x1656_67b1);
@@ -2430,7 +2439,10 @@ mod tests {
         assert!(decompress(&MAGIC).is_err());
         // A corrupt mem_bits must be rejected rather than used to size an
         // allocation: 0xFF would ask for 15 tables of 2^255 counters.
-        for mb in [0u8, 1, 15, 23, 64, 255] {
+        // derived from the bounds so raising the cap can't silently invalidate this
+        let below = MEM_BITS_MIN as u8 - 1;
+        let above = MEM_BITS_MAX as u8 + 1;
+        for mb in [0u8, 1, below, above, 64, 255] {
             let mut h = MAGIC.to_vec();
             h.push(VERSION);
             h.push(0);
