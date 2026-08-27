@@ -582,8 +582,15 @@ struct NumState {
     seen: bool,
 }
 
-const MAX_CHAIN: usize = 4; // hash-chain candidates examined per acquire
-const MAX_BACK: usize = 32; // backward context bytes compared to rank candidates
+// The two match models have different jobs, so they search differently. The
+// short-context model exists to reacquire quickly after a break, and for that the
+// *most recent* occurrence is usually the right one — searching deeper finds
+// candidates with more matching backward context that are nonetheless worse
+// predictors, which costs real ratio on logs. The long-context model exists to
+// lock onto genuine long repeats, and there depth pays enormously.
+const CHAIN_SHORT: usize = 4;
+const CHAIN_LONG: usize = 256;
+const MAX_BACK: usize = 64; // backward context bytes compared to rank candidates
 
 /// How far back the bytes before `cand` match the bytes before `cur` (capped).
 #[inline]
@@ -605,6 +612,7 @@ struct MatchModel {
     prev: Vec<u32>, // (pos & mask) -> previous position in the chain (0 = end)
     mask: usize,
     minlen: usize,
+    max_chain: usize,
     on: bool,
     ptr: usize,
     len: u32,
@@ -612,12 +620,13 @@ struct MatchModel {
 }
 
 impl MatchModel {
-    fn new(minlen: usize, mem_bits: usize) -> Self {
+    fn new(minlen: usize, max_chain: usize, mem_bits: usize) -> Self {
         Self {
             head: vec![0u32; 1 << mem_bits],
             prev: vec![0u32; 1 << mem_bits],
             mask: (1 << mem_bits) - 1,
             minlen,
+            max_chain,
             on: false,
             ptr: 0,
             len: 0,
@@ -663,11 +672,19 @@ impl MatchModel {
                 let mut depth = 0;
                 let mut best_pos = 0usize;
                 let mut best_back = 0u32;
-                while cand != 0 && cand < n && depth < MAX_CHAIN {
+                while cand != 0 && cand < n && depth < self.max_chain {
                     let back = backmatch(buf, cand, n, MAX_BACK);
                     if back > best_back {
                         best_back = back;
                         best_pos = cand;
+                        if best_back as usize >= MAX_BACK {
+                            // The score saturates at MAX_BACK, so no candidate
+                            // further down the chain can beat this one. Without
+                            // this, a deep chain limit costs its full depth on
+                            // exactly the repetitive data where the good
+                            // candidate is usually the first one examined.
+                            break;
+                        }
                     }
                     let np = self.prev[cand & self.mask] as usize;
                     if np == 0 || np >= cand {
@@ -943,7 +960,10 @@ impl Predictor {
             c0: 1,
             bitpos: 0,
             ctxh: [0; NTAB],
-            matches: vec![MatchModel::new(MINLEN, mem_bits), MatchModel::new(MINLEN_LONG, mem_bits)],
+            matches: vec![
+                MatchModel::new(MINLEN, CHAIN_SHORT, mem_bits),
+                MatchModel::new(MINLEN_LONG, CHAIN_LONG, mem_bits),
+            ],
             trust_match: (0..NMATCH).map(|_| TrustMap::new()).collect(),
             trust_rec: TrustMap::new(),
             trust_num: TrustMap::new(),
