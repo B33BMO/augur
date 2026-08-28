@@ -1,12 +1,16 @@
 # augur
 
-**A structure-aware, lossless compressor that beats `xz -9e` by understanding your data instead of just packing bytes.**
+**A structure-aware lossless compressor: it reads your data's shape instead of just packing bytes.**
 
 augur is a from-scratch context-mixing compressor built on one idea: **compression is prediction.** Predict the next bit, code only the surprise. A two-layer logistic mixer blends a portfolio of predictors — local context, word models, long-range hash-chain matches, *structure-aware* models that understand JSON fields, CSV columns, SQL-dump tuples, XML elements and log columns, a **record-history** model that replays the previous record's value for the same field, a numeric model that learns sequential and **cross-column** relationships (`lastSeen = firstSeen`, `id = seq + 100000`), stride models that find the record period of binary tables, and an adaptive-filter front-end for PCM audio — feeding a single arithmetic coder. The encoder and decoder run the identical predict→code→update loop, so they can never desync.
 
-It beats `flac -8` on lossless audio, and `xz -9e` on **all 20 other datasets tested** — by 22% on enwik8, 21% on the full
-Silesia corpus (winning every one of its 12 files), and 42–92% on real structured
-data. It is also **slow** — see the caveats.
+Where it stands, plainly:
+
+- **Against general-purpose compressors** (`xz -9e`, `zstd -19`) it wins everything tested — every one of 20 datasets, by 42–92% on real structured data.
+- **Against `flac -8`** on lossless audio it wins by 6–8%.
+- **Against `zpaq -m5`**, the strongest widely-packaged context mixer, it is **8 wins to 10**. It wins *decisively* where data has exploitable structure — 43–79% on tabular and record data, 35–52% on audio, 9% on XML — and loses by 2–7% on prose, source code and binaries.
+
+So augur is not a general-purpose ratio champion, and `xz` is not the bar to measure it against. It is a specialist: if your data has records, columns, fields or samples, it is very hard to beat. If it is prose or an executable, reach for zpaq. It is also **slow** — see the caveats.
 
 It has **zero dependencies** (not even for the CLI) and is a single Rust file.
 
@@ -47,29 +51,66 @@ in this game.
 | creed_higher.wav | 47.5 MB | 1.13x | 1.17x | 1.76x | **1.89x** | **+7.6%** |
 | waiting_for_the_end.wav | 38.9 MB | 1.10x | 1.14x | 1.67x | **1.78x** | **+6.1%** |
 
+### Head to head with zpaq -m5
+
+`zpaq -m5` is the strongest context mixer that ships in a package manager, and it
+is the honest comparison — `xz` is a different class of algorithm. Whole files:
+
+| dataset | kind | **augur** | zpaq -m5 | augur vs zpaq |
+|---|---|---|---|---|
+| xcol.csv | tabular, cross-column | **666,899** | 1,192,454 | **+78.8%** |
+| seq.ndjson | records, sequential ids | **124,589** | 205,692 | **+65.1%** |
+| waiting_for_the_end.wav | audio | **4,167,884** | 6,334,902 | **+52.0%** |
+| dump.sql | SQL dump | **70,431** | 100,380 | **+42.5%** |
+| creed_higher.wav | audio | **4,231,600** | 5,727,791 | **+35.4%** |
+| xml (Silesia) | markup | **298,926** | 327,066 | **+9.4%** |
+| nci (Silesia) | repetitive records | **1,147,259** | 1,251,228 | **+9.1%** |
+| sao (Silesia) | binary records | **3,862,937** | 3,899,377 | **+0.9%** |
+| x-ray (Silesia) | medical image | 3,719,227 | **3,669,822** | −1.3% |
+| webster (Silesia) | prose | 5,776,150 | **5,666,955** | −1.9% |
+| mr (Silesia) | medical image | 2,185,470 | **2,181,429** | −0.2% |
+| samba (Silesia) | source tar | 3,140,825 | **3,053,942** | −2.8% |
+| reymont (Silesia) | prose | 993,343 | **956,622** | −3.7% |
+| enwik8 | prose/markup | 20,384,422 | **19,625,074** | −3.7% |
+| osdb (Silesia) | database | 2,295,868 | **2,204,861** | −4.0% |
+| mozilla (Silesia) | executables | 12,552,553 | **12,041,178** | −4.1% |
+| dickens (Silesia) | prose | 2,200,029 | **2,094,866** | −4.8% |
+| ooffice (Silesia) | executables | 1,899,795 | **1,766,673** | −7.0% |
+
+**8 wins to 10.** The split is not random: augur wins by tens of percent wherever
+a parser can name what it is looking at, and loses by single digits wherever it
+cannot. Note also that augur's wins are large and its losses are small — but that
+is cold comfort if your data is prose.
+
+Not measured against zpaq: `nginx_logs`, `taxi.csv`, `taxi.ndjson` and
+`gh_events.ndjson`, whose source files were lost to a temp-directory cleanup. An
+external check reported zpaq beating augur on `nginx_logs` by about 1%
+(122,686 vs 123,918); I could not reproduce it locally and it is recorded here
+as unverified.
+
 ### Silesia
 
 The standard mixed corpus (212 MB, 12 files), and the hard case: half of it is
 binary, which is where a structure-aware compressor has the least to say. Whole
 files, not slices:
 
-| file | zstd-19 | xz-9e | **augur** | vs xz |
-|---|---|---|---|---|
-| dickens | 3.58x | 3.60x | **4.63x** | +28.7% |
-| mozilla | 3.40x | 3.83x | **4.08x** | +6.6% |
-| mr | 3.21x | 3.62x | **4.56x** | +25.9% |
-| nci | 20.15x | 23.15x | **29.25x** | +26.3% |
-| ooffice | 2.37x | 2.53x | **3.24x** | +27.8% |
-| osdb | 3.25x | 3.55x | **4.39x** | +23.9% |
-| reymont | 4.91x | 5.04x | **6.67x** | +32.4% |
-| samba | 5.55x | 5.78x | **6.88x** | +19.1% |
-| sao | 1.45x | 1.64x | **1.88x** | +14.6% |
-| webster | 4.78x | 4.95x | **7.18x** | +44.9% |
-| x-ray | 1.65x | 1.89x | **2.28x** | +20.8% |
-| xml | 11.79x | 12.29x | **17.88x** | +45.5% |
-| **aggregate** | **4.01x** | **4.37x** | **5.29x** | **+20.9%** |
+| file | zstd-19 | xz-9e | zpaq -m5 | **augur** | augur vs zpaq |
+|---|---|---|---|---|---|
+| dickens | 3.58x | 3.60x | 4.87x | **4.63x** | -4.8% |
+| mozilla | 3.40x | 3.83x | 4.25x | **4.08x** | -4.1% |
+| mr | 3.21x | 3.62x | 4.57x | **4.56x** | -0.2% |
+| nci | 20.15x | 23.15x | 26.82x | **29.25x** | +9.1% |
+| ooffice | 2.37x | 2.53x | 3.48x | **3.24x** | -7.0% |
+| osdb | 3.25x | 3.55x | 4.57x | **4.39x** | -4.0% |
+| reymont | 4.91x | 5.04x | 6.93x | **6.67x** | -3.7% |
+| samba | 5.55x | 5.78x | 7.07x | **6.88x** | -2.8% |
+| sao | 1.45x | 1.64x | 1.86x | **1.88x** | +0.9% |
+| webster | 4.78x | 4.95x | 7.32x | **7.18x** | -1.9% |
+| x-ray | 1.65x | 1.89x | 2.31x | **2.28x** | -1.3% |
+| xml | 11.79x | 12.29x | 16.34x | **17.88x** | +9.4% |
+| **aggregate** | **4.01x** | **4.37x** | **5.42x** | **5.29x** | **-2.4%** |
 
-**augur wins all 12, and the byte-weighted aggregate by 21%** — including the
+Against `xz`, **augur wins all 12 and the aggregate by 21%** — including the
 binaries a structure-aware design has no business winning. `sao` (a star
 catalogue) and `x-ray` are carried by the record-stride detector finding a period
 nothing in the file declares; `ooffice` and `mozilla` by the E8E9 pass. `nci` is
@@ -78,10 +119,13 @@ parsing traditionally wins, and where a previous version of augur lost outright
 at 20.8x against xz's 23.2x. Hash-chain match models with backward-context
 candidate selection now take it at 29.2x.
 
-Across all 20 datasets above, augur beats `xz -9e` on **20 of 20**.
+Against `zpaq -m5` the picture is different and worth stating plainly: **zpaq takes
+the Silesia aggregate by 2.4% and wins 9 of the 12 files.** augur holds `nci`
+(+9.1%), `xml` (+9.4%) and `sao` (+0.9%) — the repetitive, the markup and the
+record-structured — and loses the prose and binaries by 2–7%. Silesia is a
+general-purpose corpus, and on general-purpose data augur is not the best tool.
 
-Read: augur is strongest on structured and textual data, where it wins by wide
-margins, and is ahead everywhere else too — by a slimmer margin on binaries.
+Read: augur wins where structure exists and loses where it doesn't.
 
 ## Build
 
@@ -138,7 +182,7 @@ Table size is chosen from the input length and recorded in the header, so a smal
 - **It is slow: roughly 0.5–0.6 MB/s each way.** Context mixing is symmetric and serial — every bit must be predicted before the next can be coded, and augur consults nineteen models, four mixers and four SSE stages per bit. Encode and decode cost about the same, and both are orders of magnitude below zstd/xz. This buys the ratios above; it is the wrong tool for anything latency-sensitive, and the right one for **write-once, read-rarely** data: archival, cold feeds, backups, long-tail object storage.
 - **Memory is ~360 MB** for inputs above a couple of megabytes, scaled down for smaller ones and recorded in the header so the decoder matches. Halving it costs about 0.4% ratio; doubling it buys about 0.2%.
 - **On already-compressed or random data there is nothing to model** — augur correctly punts to ~1.0x plus a 16-byte header rather than expanding meaningfully.
-- **The ratio is not the theoretical ceiling.** Heavyweight mixers (cmix, paq8) go substantially further on text by spending thousands of times more compute. augur aims to be the best compressor you'd actually run on structured data, not the winner of an unconstrained ratio contest.
+- **It is not the best general-purpose compressor.** `zpaq -m5` beats it on prose, source code and executables by 2–7%, and takes the Silesia aggregate by 2.4%. Heavier mixers (cmix, paq8) go further still on text at enormous cost. augur's claim is narrower and, it hopes, more useful: on data with records, columns, fields or samples, nothing common comes close.
 
 ## Where the speed went
 
