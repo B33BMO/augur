@@ -4,8 +4,8 @@
 
 augur is a from-scratch context-mixing compressor built on one idea: **compression is prediction.** Predict the next bit, code only the surprise. A two-layer logistic mixer blends a portfolio of predictors — local context, word models, long-range hash-chain matches, *structure-aware* models that understand JSON fields, CSV columns, SQL-dump tuples, XML elements and log columns, a **record-history** model that replays the previous record's value for the same field, a numeric model that learns sequential and **cross-column** relationships (`lastSeen = firstSeen`, `id = seq + 100000`), and stride models that find the record period of binary tables — feeding a single arithmetic coder. The encoder and decoder run the identical predict→code→update loop, so they can never desync.
 
-It beats `xz -9e` on **all 20 datasets tested** — by 19% on enwik8, 19% on the full
-Silesia corpus (winning every one of its 12 files), and 38–90% on real structured
+It beats `xz -9e` on **all 20 datasets tested** — by 22% on enwik8, 21% on the full
+Silesia corpus (winning every one of its 12 files), and 42–92% on real structured
 data. It is also **slow** — see the caveats.
 
 It has **zero dependencies** (not even for the CLI) and is a single Rust file.
@@ -19,11 +19,11 @@ by a full compress → decompress → compare cycle.
 
 | dataset | size | zstd-19 | xz-9e | **augur** | vs xz |
 |---|---|---|---|---|---|
-| nginx_logs | 7.0 MB | 26.54x | 29.31x | **55.77x** | **+90%** |
-| taxi.csv | 22 MB | 8.12x | 8.45x | **13.90x** | **+65%** |
-| taxi.ndjson | 91 MB | 27.98x | 31.84x | **51.34x** | **+61%** |
-| gh_events.ndjson | 61 MB | 16.84x | 19.89x | **27.53x** | **+38%** |
-| enwik8 | 100 MB | 3.71x | 4.03x | **4.78x** | **+19%** |
+| nginx_logs | 7.0 MB | 26.54x | 29.31x | **56.42x** | **+92%** |
+| taxi.ndjson | 91 MB | 27.98x | 31.84x | **53.58x** | **+68%** |
+| taxi.csv | 22 MB | 8.12x | 8.45x | **13.96x** | **+65%** |
+| gh_events.ndjson | 61 MB | 16.84x | 19.89x | **28.28x** | **+42%** |
+| enwik8 | 100 MB | 3.71x | 4.03x | **4.91x** | **+22%** |
 
 ### Synthetic, to isolate the structural models
 
@@ -32,9 +32,9 @@ bound on what the structure and numeric models can do — not as typical data.
 
 | dataset | zstd-19 | xz-9e | **augur** | vs xz |
 |---|---|---|---|---|
-| seq.ndjson — sequential IDs + timestamps | 14.96x | 19.14x | **87.85x** | **+359%** |
-| dump.sql — `INSERT INTO … VALUES` batches | 10.92x | 14.47x | **45.42x** | **+214%** |
-| xcol.csv — cross-column relations | 3.13x | 3.94x | **7.06x** | **+79%** |
+| seq.ndjson — sequential IDs + timestamps | 14.96x | 19.14x | **87.75x** | **+358%** |
+| dump.sql — `INSERT INTO … VALUES` batches | 10.92x | 14.47x | **45.43x** | **+214%** |
+| xcol.csv — cross-column relations | 3.13x | 3.94x | **7.07x** | **+79%** |
 
 ### Silesia
 
@@ -44,28 +44,28 @@ files, not slices:
 
 | file | zstd-19 | xz-9e | **augur** | vs xz |
 |---|---|---|---|---|
-| dickens | 3.58x | 3.60x | **4.59x** | +27.5% |
-| mozilla | 3.40x | 3.83x | **4.01x** | +4.6% |
-| mr | 3.21x | 3.62x | **4.55x** | +25.6% |
-| nci | 20.15x | 23.15x | **27.87x** | +20.4% |
-| ooffice | 2.37x | 2.53x | **3.17x** | +25.2% |
-| osdb | 3.25x | 3.55x | **4.38x** | +23.6% |
-| reymont | 4.91x | 5.04x | **6.55x** | +30.1% |
-| samba | 5.55x | 5.78x | **6.77x** | +17.2% |
-| sao | 1.45x | 1.64x | **1.87x** | +14.4% |
-| webster | 4.78x | 4.95x | **7.02x** | +41.6% |
-| x-ray | 1.65x | 1.89x | **2.27x** | +20.4% |
-| xml | 11.79x | 12.29x | **17.59x** | +43.1% |
-| **aggregate** | **4.01x** | **4.37x** | **5.21x** | **+19.2%** |
+| dickens | 3.58x | 3.60x | **4.63x** | +28.7% |
+| mozilla | 3.40x | 3.83x | **4.08x** | +6.6% |
+| mr | 3.21x | 3.62x | **4.56x** | +25.9% |
+| nci | 20.15x | 23.15x | **29.25x** | +26.3% |
+| ooffice | 2.37x | 2.53x | **3.24x** | +27.8% |
+| osdb | 3.25x | 3.55x | **4.39x** | +23.9% |
+| reymont | 4.91x | 5.04x | **6.67x** | +32.4% |
+| samba | 5.55x | 5.78x | **6.88x** | +19.1% |
+| sao | 1.45x | 1.64x | **1.88x** | +14.6% |
+| webster | 4.78x | 4.95x | **7.18x** | +44.9% |
+| x-ray | 1.65x | 1.89x | **2.28x** | +20.8% |
+| xml | 11.79x | 12.29x | **17.88x** | +45.5% |
+| **aggregate** | **4.01x** | **4.37x** | **5.29x** | **+20.9%** |
 
-**augur wins all 12, and the byte-weighted aggregate by 19%** — including the
+**augur wins all 12, and the byte-weighted aggregate by 21%** — including the
 binaries a structure-aware design has no business winning. `sao` (a star
 catalogue) and `x-ray` are carried by the record-stride detector finding a period
 nothing in the file declares; `ooffice` and `mozilla` by the E8E9 pass. `nci` is
 the interesting one: it is extremely repetitive data where LZMA's long-match
 parsing traditionally wins, and where a previous version of augur lost outright
 at 20.8x against xz's 23.2x. Hash-chain match models with backward-context
-candidate selection now take it at 27.9x.
+candidate selection now take it at 29.2x.
 
 Across all 20 datasets above, augur beats `xz -9e` on **20 of 20**.
 
@@ -102,8 +102,8 @@ The portfolio:
 
 - **Order 0,1,2,3,4,6,8 context models** — local byte statistics. Counters track a hit count and adapt at `1/(n+1.5)`, so a context seen once jumps most of the way to what it saw, while a well-established one barely moves.
 - **Word models** — the alphanumeric token being typed, and that token in the company of the one before it. Byte orders see `tio`; this sees `informatio`, and `the informatio`.
-- **Match models (hash chains)** — long-range repeats, the redundancy a local model structurally cannot see. On a miss, each model walks a chain of recent positions sharing the current context and picks the one whose *preceding* bytes match longest — locking onto genuine long repeats instead of the most-recent coincidence.
-- **Structure models** — a streaming, format-aware parser exposes *semantic position*: which JSON field's value, which CSV column, which SQL `INSERT ... VALUES` tuple column, which XML element, or which whitespace-delimited column of a log line you are currently inside. Byte-level coders can't condition on "I'm reading the value of `created_at`"; augur can. The format is sniffed at compress time and recorded in the header, so the decoder configures the same parser.
+- **Match models (hash chains)** — long-range repeats, the redundancy a local model structurally cannot see. On a miss, each model walks a chain of recent positions sharing the current context and picks the one whose *preceding* bytes match longest. The two models search differently on purpose: the short-context one reacquires after a break, where the most *recent* occurrence is usually right and searching deeper actively hurts; the long-context one locks onto genuine long repeats, where depth pays enormously. A shared search depth costs one job or the other.
+- **Structure models** — a streaming, format-aware parser exposes *semantic position*: which JSON field's value, which CSV column, which SQL `INSERT ... VALUES` tuple column, which XML element, or which whitespace-delimited column of a log line you are currently inside. Byte-level coders can't condition on "I'm reading the value of `created_at`"; augur can. Three contexts are formed from it — field with position-in-value, field with a secondary axis, and field crossed with the last two bytes, which is far more specific than either half alone. The format is sniffed at compress time and recorded in the header, so the decoder configures the same parser.
 - **Record-history model** — replays the previous record's value *for this field*, from its very first byte. This is redundancy the match model is structurally blind to: it needs six matching bytes of context before it can speak, and the bytes immediately before a field's value belong to a *different* field. `"city":"Springfield"` follows `"city":"Springfield"` even when the id and timestamp before them share nothing.
 - **Numeric model** — predicts the digits of a value *before reading them*, choosing the more confident of two hypotheses: cross-row extrapolation (`last + delta` — auto-increment IDs, timestamps, counters) or a **cross-column** relation within the same row (a copy like `lastSeen = firstSeen`, or a constant offset like `id = seq + 100000`).
 - **Stride and sparse models** — binary tables (a star catalogue, a database page, a struct array) repeat with a period nothing in the file declares. augur watches how far apart four-byte patterns recur and lets the winning distance vote itself into being the record length, then models each value against the one a *record* above it. Text never produces a sharp peak, so these stay silent.
@@ -123,7 +123,7 @@ Table size is chosen from the input length and recorded in the header, so a smal
 ## Honest caveats
 
 - **It is slow: roughly 0.5–0.6 MB/s each way.** Context mixing is symmetric and serial — every bit must be predicted before the next can be coded, and augur consults nineteen models, four mixers and four SSE stages per bit. Encode and decode cost about the same, and both are orders of magnitude below zstd/xz. This buys the ratios above; it is the wrong tool for anything latency-sensitive, and the right one for **write-once, read-rarely** data: archival, cold feeds, backups, long-tail object storage.
-- **Memory is ~120 MB** for inputs above a megabyte, scaled down for smaller ones and recorded in the header so the decoder matches.
+- **Memory is ~360 MB** for inputs above a couple of megabytes, scaled down for smaller ones and recorded in the header so the decoder matches. Halving it costs about 0.4% ratio; doubling it buys about 0.2%.
 - **On already-compressed or random data there is nothing to model** — augur correctly punts to ~1.0x plus a 16-byte header rather than expanding meaningfully.
 - **The ratio is not the theoretical ceiling.** Heavyweight mixers (cmix, paq8) go substantially further on text by spending thousands of times more compute. augur aims to be the best compressor you'd actually run on structured data, not the winner of an unconstrained ratio contest.
 
