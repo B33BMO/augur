@@ -1988,6 +1988,288 @@ impl Predictor {
 }
 
 // ---------------------------------------------------------------------------
+// Lossless audio front-end.
+//
+// PCM audio defeats every model in the portfolio. A waveform is not a sequence
+// of repeated byte strings — sample 44100 has almost nothing byte-wise in common
+// with sample 44099, even though it is nearly *numerically* equal to it. Context
+// models see noise, the match models never fire, and augur lands well behind
+// FLAC, which is not even a context mixer: it just predicts each sample from its
+// neighbours and codes the difference.
+//
+// So do that, and hand the difference to the mixer. Three stages, each exactly
+// invertible:
+//
+//   1. Mid/side. Stereo channels are highly correlated; coding (L-R) instead of
+//      R removes most of that. Using a shift rather than a divide keeps it exact.
+//   2. A cascade of sign-sign LMS filters. Rather than fitting coefficients per
+//      block and storing them like FLAC does, the filter *adapts* — and because
+//      the decoder runs the identical integer update on the samples it has
+//      already reconstructed, the two stay in lockstep with no side channel at
+//      all. This is the same predict-code-update symmetry as the rest of augur.
+//   3. Zigzag, then split into byte planes. Residuals are small and signed, so
+//      zigzag maps them near zero, and separating high bytes from low bytes puts
+//      all the near-constant bytes in one run instead of interleaving them with
+//      the noisy ones.
+//
+// What is left is a residual stream whose entropy is far below the waveform's,
+// and which the existing context models handle well.
+// ---------------------------------------------------------------------------
+
+/// One sign-sign LMS stage. Integer throughout: the update uses only the signs
+/// of the error and the history, so there is no multiply in the adaptation and
+/// no possibility of the encoder and decoder diverging on rounding.
+struct Lms {
+    w: Vec<i32>,
+    hist: Vec<i32>,
+    shift: u32,
+    mu: i32,
+}
+
+impl Lms {
+    fn new(order: usize, shift: u32, mu: i32) -> Self {
+        Self { w: vec![0; order], hist: vec![0; order], shift, mu }
+    }
+
+    #[inline]
+    fn predict(&self) -> i32 {
+        let mut dot: i64 = 0;
+        for i in 0..self.w.len() {
+            dot += self.w[i] as i64 * self.hist[i] as i64;
+        }
+        (dot >> self.shift) as i32
+    }
+
+    /// Adapt toward `actual`, then push it into the history.
+    #[inline]
+    fn update(&mut self, actual: i32, pred: i32) {
+        let err = actual - pred;
+        if err != 0 {
+            let s = if err > 0 { self.mu } else { -self.mu };
+            for i in 0..self.w.len() {
+                self.w[i] += match self.hist[i].cmp(&0) {
+                    std::cmp::Ordering::Greater => s,
+                    std::cmp::Ordering::Less => -s,
+                    std::cmp::Ordering::Equal => 0,
+                };
+            }
+        }
+        self.hist.rotate_right(1);
+        self.hist[0] = actual;
+    }
+}
+
+/// (order, weight shift, adaptation step) per stage. Shift and step trade off
+/// against each other — halving the shift is the same as doubling the step — so
+/// what these encode is really one adaptation rate per stage, tuned on music.
+const LMS_STAGES: [(usize, u32, i32); 2] = [(24, 11, 2), (256, 12, 1)];
+
+// forward()/inverse() unroll the cascade by hand, so a third entry here would be
+// constructed and then silently never consulted.
+const _: () = assert!(LMS_STAGES.len() == 2, "cascade is unrolled for exactly two stages");
+
+/// A fixed 2nd-order extrapolation followed by adaptive stages, each predicting
+/// the previous stage's residual.
+///
+/// The fixed stage matters more than it looks. An LMS filter starts from zero
+/// weights, so without it the filter has to *learn* that audio is smooth before
+/// it can predict anything — paying full price for the first few thousand
+/// samples of every file, and never quite recovering the slope term. Standing it
+/// on `2*x[n-1] - x[n-2]` means the adaptive stages only ever model what a
+/// straight line through the last two samples failed to capture.
+struct LmsCascade {
+    h1: i32,
+    h2: i32,
+    stages: Vec<Lms>,
+}
+
+impl LmsCascade {
+    fn new() -> Self {
+        // A short fast-adapting filter catches the local waveform slope; the long
+        // slow one catches periodicity (pitch, room tone) the short one cannot see.
+        Self { h1: 0, h2: 0, stages: LMS_STAGES.iter().map(|&(o, s, m)| Lms::new(o, s, m)).collect() }
+    }
+
+    #[inline]
+    fn fixed_pred(&self) -> i32 {
+        2 * self.h1 - self.h2
+    }
+
+    #[inline]
+    fn push_fixed(&mut self, x: i32) {
+        self.h2 = self.h1;
+        self.h1 = x;
+    }
+
+    /// Forward: sample in, residual out.
+    ///
+    /// Every intermediate is reduced to 16 bits. That is not an optimisation —
+    /// it is what makes the transform invertible. Residuals are stored in 16
+    /// bits, so the decoder only ever learns them modulo 2^16; if the encoder
+    /// carried full-width intermediates, a prediction that overshot would leave
+    /// the decoder reconstructing a value 65536 away, and the two filter
+    /// histories would silently diverge from that sample on. Wrapping both sides
+    /// identically makes the arithmetic exact in the only sense that matters.
+    #[inline]
+    fn forward(&mut self, x: i32) -> i32 {
+        let p0 = self.fixed_pred();
+        let e0 = wrap16(x - p0);
+        let p1 = self.stages[0].predict();
+        let e1 = wrap16(e0 - p1);
+        self.stages[0].update(e0, p1);
+        let p2 = self.stages[1].predict();
+        let e2 = wrap16(e1 - p2);
+        self.stages[1].update(e1, p2);
+        self.push_fixed(x);
+        e2
+    }
+
+    /// Inverse: residual in, sample out. Unwinds `forward` stage by stage, with
+    /// the same wrapping at each step, so the filters see identical inputs.
+    #[inline]
+    fn inverse(&mut self, e2: i32) -> i32 {
+        let p0 = self.fixed_pred();
+        let p1 = self.stages[0].predict();
+        let p2 = self.stages[1].predict();
+        let e1 = wrap16(e2 + p2);
+        let e0 = wrap16(e1 + p1);
+        let x = wrap16(e0 + p0);
+        self.stages[0].update(e0, p1);
+        self.stages[1].update(e1, p2);
+        self.push_fixed(x);
+        x
+    }
+}
+
+/// Reduce to a signed 16-bit value. Both directions of the audio transform apply
+/// this at every stage so their arithmetic agrees exactly.
+#[inline]
+fn wrap16(v: i32) -> i32 {
+    (v as u16) as i16 as i32
+}
+
+struct WavFmt {
+    channels: usize,
+    data_off: usize,
+    data_len: usize,
+}
+
+/// Locate the `fmt ` and `data` chunks. Only 16-bit PCM is handled; anything
+/// else falls through and is compressed as ordinary bytes.
+fn wav_parse(d: &[u8]) -> Option<WavFmt> {
+    if d.len() < 44 || &d[0..4] != b"RIFF" || &d[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12usize;
+    let mut channels = 0usize;
+    let mut bits = 0usize;
+    let mut fmt_ok = false;
+    while pos + 8 <= d.len() {
+        let id = &d[pos..pos + 4];
+        let sz = u32::from_le_bytes(d[pos + 4..pos + 8].try_into().ok()?) as usize;
+        if id == b"fmt " && pos + 24 <= d.len() {
+            let format = u16::from_le_bytes(d[pos + 8..pos + 10].try_into().ok()?);
+            channels = u16::from_le_bytes(d[pos + 10..pos + 12].try_into().ok()?) as usize;
+            bits = u16::from_le_bytes(d[pos + 22..pos + 24].try_into().ok()?) as usize;
+            fmt_ok = format == 1;
+        }
+        if id == b"data" {
+            let off = pos + 8;
+            let len = sz.min(d.len().saturating_sub(off));
+            if !fmt_ok || bits != 16 || channels == 0 || channels > 2 {
+                return None;
+            }
+            // whole frames only; a ragged tail is left untransformed
+            let len = len - (len % (2 * channels));
+            if len == 0 {
+                return None;
+            }
+            return Some(WavFmt { channels, data_off: off, data_len: len });
+        }
+        pos = pos.checked_add(8)?.checked_add(sz)?.checked_add(sz & 1)?;
+    }
+    None
+}
+
+/// Apply (or undo) the audio transform in place over the data chunk. Everything
+/// outside that chunk — headers, trailing metadata — is left byte-for-byte alone.
+fn wav_transform(data: &mut [u8], forward: bool) -> bool {
+    let Some(f) = wav_parse(data) else { return false };
+    let (off, ch) = (f.data_off, f.channels);
+    let frames = f.data_len / (2 * ch);
+    let body = &mut data[off..off + f.data_len];
+
+    let mut filters: Vec<LmsCascade> = (0..ch).map(|_| LmsCascade::new()).collect();
+    let mut out = vec![0u16; frames * ch];
+
+    if forward {
+        // gather interleaved samples, decorrelate, filter, zigzag
+        for n in 0..frames {
+            let mut s = [0i32; 2];
+            for c in 0..ch {
+                let i = (n * ch + c) * 2;
+                s[c] = i16::from_le_bytes([body[i], body[i + 1]]) as i32;
+            }
+            if ch == 2 {
+                // L-R needs 17 bits, so wrap it: the inverse works modulo 2^16
+                // too, and both channels are recovered exactly because the
+                // originals are known to be 16-bit.
+                let side = wrap16(s[0] - s[1]);
+                let mid = wrap16(s[1] + (side >> 1));
+                s = [mid, side];
+            }
+            for c in 0..ch {
+                let r = filters[c].forward(s[c]);
+                out[n * ch + c] = zigzag16(r);
+            }
+        }
+        // byte planes: all high bytes, then all low bytes
+        let total = frames * ch;
+        for (k, v) in out.iter().enumerate() {
+            body[k] = (v >> 8) as u8;
+            body[total + k] = (*v & 0xff) as u8;
+        }
+    } else {
+        let total = frames * ch;
+        for k in 0..total {
+            out[k] = ((body[k] as u16) << 8) | body[total + k] as u16;
+        }
+        for n in 0..frames {
+            let mut s = [0i32; 2];
+            for c in 0..ch {
+                s[c] = filters[c].inverse(unzigzag16(out[n * ch + c]));
+            }
+            if ch == 2 {
+                let (mid, side) = (s[0], s[1]);
+                let r = wrap16(mid - (side >> 1));
+                s = [wrap16(side + r), r];
+            }
+            for c in 0..ch {
+                let i = (n * ch + c) * 2;
+                let b = (s[c] as i16).to_le_bytes();
+                body[i] = b[0];
+                body[i + 1] = b[1];
+            }
+        }
+    }
+    true
+}
+
+/// Map a signed residual into u16 with small magnitudes near zero. The value is
+/// reduced mod 2^16 first, which is what makes the whole pipeline exact even
+/// when a prediction overshoots the 16-bit range.
+#[inline]
+fn zigzag16(r: i32) -> u16 {
+    let v = (r as u16) as i16;
+    ((v << 1) ^ (v >> 15)) as u16
+}
+
+#[inline]
+fn unzigzag16(z: u16) -> i32 {
+    (((z >> 1) as i16) ^ -((z & 1) as i16)) as i32
+}
+
+// ---------------------------------------------------------------------------
 // E8E9: x86 call/jump offset transform.
 //
 // `CALL` and `JMP` on x86 encode their target as an offset *relative to the
@@ -2070,6 +2352,7 @@ const MAGIC: [u8; 4] = *b"AUGR";
 const VERSION: u8 = 2;
 const HEADER_LEN: usize = 16;
 const FLAG_E8E9: u8 = 1;
+const FLAG_WAV: u8 = 2;
 
 fn encode_stream(data: &[u8], mode: Mode, mem_bits: usize) -> Vec<u8> {
     let mut pr = Predictor::new(mode, mem_bits);
@@ -2105,11 +2388,19 @@ fn decode_stream(stream: &[u8], mode: Mode, mem_bits: usize, orig_len: usize) ->
 fn compress(data: &[u8]) -> Vec<u8> {
     let mode = sniff(data);
     let mem_bits = mem_bits_for(data.len());
-    // only unstructured data is a plausible carrier for machine code
     let mut flags = 0u8;
     let mut owned;
     let mut body = data;
-    if mode == Mode::Generic && e8e9_helps(data, mode) {
+    if wav_parse(data).is_some() {
+        // 16-bit PCM: predict each sample from its neighbours and code the residual
+        let mut t = data.to_vec();
+        if wav_transform(&mut t, true) {
+            flags |= FLAG_WAV;
+            owned = t;
+            body = &owned;
+        }
+    } else if mode == Mode::Generic && e8e9_helps(data, mode) {
+        // only unstructured data is a plausible carrier for machine code
         flags |= FLAG_E8E9;
         owned = data.to_vec();
         e8e9(&mut owned, true);
@@ -2145,6 +2436,9 @@ fn decompress(container: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = decode_stream(&container[HEADER_LEN..], mode, mem_bits, orig_len);
     if flags & FLAG_E8E9 != 0 {
         e8e9(&mut out, false);
+    }
+    if flags & FLAG_WAV != 0 {
+        wav_transform(&mut out, false);
     }
     Ok(out)
 }
@@ -2443,6 +2737,97 @@ mod tests {
             }
         }
         roundtrip(&data);
+    }
+
+    fn make_wav(samples: &[(i16, i16)]) -> Vec<u8> {
+        let data_len = samples.len() * 4;
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        w.extend_from_slice(&2u16.to_le_bytes()); // stereo
+        w.extend_from_slice(&44100u32.to_le_bytes());
+        w.extend_from_slice(&176_400u32.to_le_bytes());
+        w.extend_from_slice(&4u16.to_le_bytes());
+        w.extend_from_slice(&16u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(data_len as u32).to_le_bytes());
+        for (l, r) in samples {
+            w.extend_from_slice(&l.to_le_bytes());
+            w.extend_from_slice(&r.to_le_bytes());
+        }
+        w
+    }
+
+    #[test]
+    fn wav_transform_survives_adversarial_audio() {
+        // The residual is stored in 16 bits, so the decoder only learns it modulo
+        // 2^16. Anything that makes a prediction overshoot — full-scale content,
+        // sign flips, L-R needing a 17th bit — used to desync the filters. These
+        // are the signals that provoke it.
+        let mut cases: Vec<Vec<(i16, i16)>> = Vec::new();
+        cases.push((0..5000).map(|i| if i % 2 == 0 { (i16::MAX, i16::MIN) } else { (i16::MIN, i16::MAX) }).collect());
+        cases.push((0..5000).map(|_| (i16::MAX, i16::MIN)).collect());
+        cases.push((0..5000).map(|_| (0i16, 0i16)).collect());
+        let noise = pseudo_random(20_000);
+        cases.push(
+            noise
+                .chunks(4)
+                .map(|c| {
+                    (
+                        i16::from_le_bytes([c[0], c[1]]),
+                        i16::from_le_bytes([c[2], c[3]]),
+                    )
+                })
+                .collect(),
+        );
+        // a loud sine, which is what real music's envelope looks like
+        cases.push(
+            (0..5000)
+                .map(|i| {
+                    let v = ((i as f64 * 0.07).sin() * 32700.0) as i16;
+                    (v, -v)
+                })
+                .collect(),
+        );
+        for c in cases {
+            let wav = make_wav(&c);
+            assert!(wav_parse(&wav).is_some(), "test wav should be recognised");
+            roundtrip(&wav);
+        }
+    }
+
+    #[test]
+    fn wav_transform_is_exactly_invertible() {
+        // direct check on the transform itself, independent of the coder
+        let c: Vec<(i16, i16)> = (0..3000)
+            .map(|i| {
+                let a = (i as i32 * 7919 % 65536 - 32768) as i16;
+                let b = (i as i32 * 104_729 % 65536 - 32768) as i16;
+                (a, b)
+            })
+            .collect();
+        let orig = make_wav(&c);
+        let mut t = orig.clone();
+        assert!(wav_transform(&mut t, true));
+        assert!(t != orig, "transform should change the data chunk");
+        assert!(wav_transform(&mut t, false));
+        assert!(t == orig, "wav transform must invert exactly");
+    }
+
+    #[test]
+    fn non_pcm_wav_is_left_alone() {
+        // 8-bit, 24-bit, multichannel and non-PCM must fall through untransformed
+        let mut w = make_wav(&[(1, 2), (3, 4)]);
+        w[34] = 24; // bits per sample
+        assert!(wav_parse(&w).is_none());
+        roundtrip(&w);
+        let mut w2 = make_wav(&[(1, 2), (3, 4)]);
+        w2[20] = 3; // IEEE float, not PCM
+        assert!(wav_parse(&w2).is_none());
+        roundtrip(&w2);
     }
 
     #[test]

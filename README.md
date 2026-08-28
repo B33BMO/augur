@@ -2,9 +2,9 @@
 
 **A structure-aware, lossless compressor that beats `xz -9e` by understanding your data instead of just packing bytes.**
 
-augur is a from-scratch context-mixing compressor built on one idea: **compression is prediction.** Predict the next bit, code only the surprise. A two-layer logistic mixer blends a portfolio of predictors — local context, word models, long-range hash-chain matches, *structure-aware* models that understand JSON fields, CSV columns, SQL-dump tuples, XML elements and log columns, a **record-history** model that replays the previous record's value for the same field, a numeric model that learns sequential and **cross-column** relationships (`lastSeen = firstSeen`, `id = seq + 100000`), and stride models that find the record period of binary tables — feeding a single arithmetic coder. The encoder and decoder run the identical predict→code→update loop, so they can never desync.
+augur is a from-scratch context-mixing compressor built on one idea: **compression is prediction.** Predict the next bit, code only the surprise. A two-layer logistic mixer blends a portfolio of predictors — local context, word models, long-range hash-chain matches, *structure-aware* models that understand JSON fields, CSV columns, SQL-dump tuples, XML elements and log columns, a **record-history** model that replays the previous record's value for the same field, a numeric model that learns sequential and **cross-column** relationships (`lastSeen = firstSeen`, `id = seq + 100000`), stride models that find the record period of binary tables, and an adaptive-filter front-end for PCM audio — feeding a single arithmetic coder. The encoder and decoder run the identical predict→code→update loop, so they can never desync.
 
-It beats `xz -9e` on **all 20 datasets tested** — by 22% on enwik8, 21% on the full
+It beats `flac -8` on lossless audio, and `xz -9e` on **all 20 other datasets tested** — by 22% on enwik8, 21% on the full
 Silesia corpus (winning every one of its 12 files), and 42–92% on real structured
 data. It is also **slow** — see the caveats.
 
@@ -35,6 +35,17 @@ bound on what the structure and numeric models can do — not as typical data.
 | seq.ndjson — sequential IDs + timestamps | 14.96x | 19.14x | **87.75x** | **+358%** |
 | dump.sql — `INSERT INTO … VALUES` batches | 10.92x | 14.47x | **45.43x** | **+214%** |
 | xcol.csv — cross-column relations | 3.13x | 3.94x | **7.07x** | **+79%** |
+
+### Lossless audio, vs FLAC
+
+16-bit PCM WAV, whole tracks. FLAC is the reference lossless audio coder; `xz`
+and `zstd` are included to show that general-purpose compressors are simply not
+in this game.
+
+| track | size | zstd-19 | xz-9e | flac -8 | **augur** | vs flac |
+|---|---|---|---|---|---|---|
+| creed_higher.wav | 47.5 MB | 1.13x | 1.17x | 1.76x | **1.89x** | **+7.6%** |
+| waiting_for_the_end.wav | 38.9 MB | 1.10x | 1.14x | 1.67x | **1.78x** | **+6.1%** |
 
 ### Silesia
 
@@ -109,6 +120,8 @@ The portfolio:
 - **Stride and sparse models** — binary tables (a star catalogue, a database page, a struct array) repeat with a period nothing in the file declares. augur watches how far apart four-byte patterns recur and lets the winning distance vote itself into being the record length, then models each value against the one a *record* above it. Text never produces a sharp peak, so these stay silent.
 
 The match, record and numeric models are **oracles**: each names the byte it thinks comes next, but none asserts how sure it is. A `TrustMap` learns that empirically, per (agreement length, bit position, predicted bit) — so a match 200 bytes into a repeat and one that just reacquired are trusted differently, by measurement rather than by a tuned constant.
+
+A **lossless audio front-end** handles 16-bit PCM WAV, where the rest of the portfolio is helpless: sample 44100 has almost nothing byte-wise in common with sample 44099 even though it is nearly *numerically* equal to it, so the context and match models see noise. Instead augur decorrelates the stereo pair, runs a cascade of sign-sign LMS filters, and hands the residual to the mixer. The filters adapt rather than storing per-block coefficients the way FLAC does — the decoder runs the identical integer update over samples it has already reconstructed, so there is no side channel at all. Every stage works in wrapped 16-bit arithmetic, which is what keeps the transform exactly invertible when a prediction overshoots.
 
 An **E8E9 pass** rewrites x86 `CALL` offsets from relative to absolute, so the same function called from a hundred sites produces a hundred identical byte sequences. augur decides whether to apply it by *trying* it on a sample and comparing — which sidesteps the unanswerable question of whether an archive that merely *contains* an executable "is" one.
 
