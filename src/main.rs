@@ -8,8 +8,12 @@
 //! drift out of sync (the classic context-mixing failure mode).
 //!
 //! Portfolio:
-//!   - order 0,1,2,3,4,6,8 direct context models (local statistics)
-//!   - WORD models: the token being typed, and that token after the previous one
+//!   - order 0-6, 8, 12, 16, 24 context models (local statistics), each a
+//!     checksummed slot holding bit histories + direct counters, all sharing
+//!     one memory pool; plus a run map, indirect, text-column and byte-class
+//!     "shape" contexts
+//!   - WORD models: the token being typed, with the previous word(s) as
+//!     bigram, trigram and skip-gram
 //!   - MATCH models (hash chains): long-range repeats — what byte contexts can't
 //!     see — with backward-context candidate selection
 //!   - STRUCTURE models: a streaming parser exposes "which field's value am I
@@ -24,6 +28,8 @@
 //!     including cross-column relations within a row.
 //!   - STRIDE/SPARSE models: a detected record period turns binary tables into
 //!     columns; sparse contexts skip bytes to see interleaved fields.
+//!   - Front-ends: LMS filters for 16-bit PCM audio, a blended 2-D predictor
+//!     for raw 16-bit images (geometry detected, not parsed), E8E9 for x86.
 //!
 //! The oracles (match, record, numeric) do not assert a confidence — a TrustMap
 //! learns, per situation, how often each has actually been right. A two-layer
@@ -40,7 +46,9 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
-// Binary arithmetic coder (carryless, 32-bit). p is P(bit==1) in 12-bit units.
+// Binary arithmetic coder (carryless, 32-bit). p is P(bit==1) in 16-bit units:
+// on highly redundant data a 12-bit probability caps every bit at a cost of at
+// least log2(4096/4095), a floor that is a visible fraction of the output.
 // ---------------------------------------------------------------------------
 
 struct Encoder {
@@ -57,7 +65,7 @@ impl Encoder {
     #[inline]
     fn encode(&mut self, bit: u32, p: u32) {
         let range = (self.x2 - self.x1) as u64;
-        let xmid = self.x1 + ((range * p as u64) >> 12) as u32;
+        let xmid = self.x1 + ((range * p as u64) >> 16) as u32;
         if bit == 1 {
             self.x2 = xmid;
         } else {
@@ -106,7 +114,7 @@ impl<'a> Decoder<'a> {
     #[inline]
     fn decode(&mut self, p: u32) -> u32 {
         let range = (self.x2 - self.x1) as u64;
-        let xmid = self.x1 + ((range * p as u64) >> 12) as u32;
+        let xmid = self.x1 + ((range * p as u64) >> 16) as u32;
         let bit = if self.x <= xmid {
             self.x2 = xmid;
             1
@@ -179,6 +187,11 @@ fn build_squash() -> Vec<i32> {
 /// allocating 200 MB of slots for a 4 KB input that can never touch them.
 const MEM_BITS_MIN: usize = 16;
 const MEM_BITS_MAX: usize = 23;
+/// All context models share one pool of 2^(mem_bits + POOL_DELTA) slots, 64
+/// bytes each: 512 MB at the largest size. Sharing lets memory flow to the
+/// contexts that need it — order 1 has a few thousand contexts and order 24 has
+/// millions, so equal per-model tables starve one and waste the other.
+const POOL_DELTA: usize = 0;
 
 fn mem_bits_for(len: usize) -> usize {
     let bl = usize::BITS - len.max(1).leading_zeros(); // ceil-ish log2
@@ -187,31 +200,42 @@ fn mem_bits_for(len: usize) -> usize {
 /// Byte-context orders modelled, in addition to order 0. Skipping 5 and 7 keeps
 /// the portfolio cheap: adjacent orders are highly correlated, so the marginal
 /// value of order 5 next to 4 and 6 is small compared to its table cost.
-const ORDERS: [usize; 6] = [1, 2, 3, 4, 6, 8];
+const ORDERS: [usize; 10] = [1, 2, 3, 4, 5, 6, 8, 12, 16, 24];
 const NORD: usize = 1 + ORDERS.len();
-const NWORD: usize = 2; // word model + (previous word, word) model
+const NWORD: usize = 4; // word, (previous word, word), the trigram, and a skip-gram
 const NSTR: usize = 3;
 const NBIN: usize = 4; // 2 record-stride + 2 sparse contexts
-const NTAB: usize = NORD + NWORD + NSTR + NBIN;
+const NCOL: usize = 2; // text column: the byte above in the previous line
+const NIND: usize = 2; // indirect: what followed this byte / byte pair last time
+const NSHAPE: usize = 3; // byte-class shape of the recent past: short, long, and fine-grained
+const NTAB: usize = NORD + NWORD + NSTR + NBIN + NCOL + NIND + NSHAPE;
 const WORD0: usize = NORD; // first word-model slot in ctxh
 const STR0: usize = NORD + NWORD; // first structure-model slot in ctxh
 const BIN0: usize = STR0 + NSTR; // first binary/record-stride slot in ctxh
+const COL0: usize = BIN0 + NBIN; // first text-column slot in ctxh
+const IND0: usize = COL0 + NCOL; // first indirect slot in ctxh
+const SHAPE0: usize = IND0 + NIND;
 const NMATCH: usize = 2; // match models: short-context (fast reacquire) + long (locks long repeats)
 const NREC: usize = 1; // record-history model
-const NIN: usize = NTAB + NMATCH + NREC + 1; // tables + match + record + numeric
+const NRUN: usize = 1; // run map: the highest order whose context keeps repeating one byte
+const ORA0: usize = 3 * NTAB; // first oracle input: each context feeds a counter and a bit history
+const NIN: usize = ORA0 + NMATCH + NREC + NRUN + 1; // contexts + match + record + run + numeric
 const MINLEN: usize = 6;
 const MINLEN_LONG: usize = 16;
 const CLIMIT: u16 = 8; // counter saturation: caps the slowest adaptation rate
 const LR: i32 = 15; // mixer learning rate (retuned for the two-layer mixer)
 const APM_RATE: i32 = 8; // SSE adaptation shift
-const NMIX: usize = 4; // layer-1 mixers, one per selector view
+const APM_EDGE: i32 = 1; // closest an SSE cell may get to certainty, in 1/65536
+const NMIX: usize = 5; // layer-1 mixers, one per selector view
 /// log2(weight sets) for each layer-1 mixer: partial byte, previous byte,
 /// match-state x bit position, structure context.
 /// Mixer 2's selector packs a 4-bit match-length bucket, three oracle on-flags
 /// and a 3-bit bit position — ten bits. Anything narrower silently masks the
 /// length bucket away, which is the most informative thing there: how much to
 /// trust the match model is almost entirely a question of how long the match is.
-const MIX_CTX_BITS: [usize; NMIX] = [8, 8, 10, 8];
+/// Mixer 4 is keyed on the effective order (how many byte orders have seen this
+/// context before), plus word and structure hits and the bit position.
+const MIX_CTX_BITS: [usize; NMIX] = [8, 8, 10, 8, 9];
 const ARRAY_TAG: u32 = 0xA22A_5151;
 const NUMSLOTS: usize = 1 << 16;
 const REC_MAXLEN: u32 = 8192; // longest value the record model will remember
@@ -449,6 +473,7 @@ fn wide_update(v: u32, bit: u32) -> u32 {
 
 struct TrustMap {
     t: Vec<u32>,
+    mask: usize,
     idx: usize,
     active: bool,
     stab: &'static [i32],
@@ -456,13 +481,17 @@ struct TrustMap {
 
 impl TrustMap {
     fn new() -> Self {
-        Self { t: vec![TRUST_INIT; TRUST_CTX], idx: 0, active: false, stab: stretch_tab() }
+        Self::with_size(TRUST_CTX)
+    }
+
+    fn with_size(n: usize) -> Self {
+        Self { t: vec![TRUST_INIT; n], mask: n - 1, idx: 0, active: false, stab: stretch_tab() }
     }
 
     /// Stretched P(bit==1) given the oracle's state; remembers the cell to train.
     #[inline]
     fn predict(&mut self, cx: usize) -> i32 {
-        self.idx = cx & (TRUST_CTX - 1);
+        self.idx = cx & self.mask;
         self.active = true;
         // SAFETY: idx is masked into range; ctr_p12 < 4096 = stretch_tab.len()
         unsafe { *self.stab.get_unchecked(wide_p12(*self.t.get_unchecked(self.idx))) }
@@ -772,8 +801,11 @@ impl Apm {
         Self { t, idx: 0, mask: n - 1, stab: stretch_tab() }
     }
 
+    /// Refine a 16-bit probability; returns 16-bit. The bucket lookup only
+    /// needs the 12-bit stretch domain, but the output keeps full precision.
     #[inline]
-    fn refine(&mut self, pr: i32, cx: usize) -> i32 {
+    fn refine(&mut self, pr16: i32, cx: usize) -> i32 {
+        let pr = (pr16 >> 4).clamp(1, 4095);
         // SAFETY: pr is clamped to 1..4095 by every caller; s lands in 1..4095 so
         // (s>>7) is 0..31 and i+1 stays inside the context's 33-bucket row.
         let s = unsafe { *self.stab.get_unchecked(pr as usize) } + 2048;
@@ -782,17 +814,68 @@ impl Apm {
         self.idx = i + (w >> 6) as usize;
         let lo = unsafe { *self.t.get_unchecked(i) } as i32;
         let hi = unsafe { *self.t.get_unchecked(i + 1) } as i32;
-        ((lo * (128 - w) + hi * w) >> 11).clamp(1, 4095)
+        (lo * (128 - w) + hi * w) >> 7
     }
 
     #[inline]
     fn update(&mut self, bit: u32, rate: i32) {
-        // nudge toward the observed bit, but stop just short of 0/65536 so a
-        // single surprise can never cost an unbounded number of bits
-        let g = ((bit as i32) << 16) + ((bit as i32) << rate) - (bit as i32) * 2;
+        // nudge toward the observed bit, but stop short of 0/65536 so a single
+        // surprise can never cost an unbounded number of bits. The target
+        // overshoots by just under one step and the step truncates toward zero,
+        // so a cell settles exactly APM_EDGE from either end — symmetrically.
+        // (An arithmetic shift here rounds negative steps away from zero, which
+        // let cells reach P=0 on the 0 side; a 12-bit output clamp used to hide it.)
+        let step = 1i32 << rate;
+        let g = if bit == 1 { 65535 - APM_EDGE + step - 1 } else { APM_EDGE - step + 1 };
         let cell = unsafe { self.t.get_unchecked_mut(self.idx) };
-        *cell = (*cell as i32 + ((g - *cell as i32) >> rate)) as u16;
+        let c = *cell as i32;
+        *cell = (c + (g - c) / step).clamp(0, 65535) as u16;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Probability floor, chosen online.
+//
+// The coder takes 16-bit probabilities, so a bit can cost as little as
+// log2(65536/65535). That pays handsomely on highly redundant data and hurts on
+// prose, where the rare surprise after an overconfident run costs more than the
+// certainty saved. No calibration stage fixes this — the surprises are not
+// foreseeable from any context — so instead both sides keep a decayed tally of
+// what each floor *would* have cost on the bits already coded, and use
+// whichever has been cheaper. It is causal, so the decoder makes the identical
+// choice with no side information, and it can change its mind mid-file.
+// ---------------------------------------------------------------------------
+
+const FLOOR_LO: i32 = 1; // full 16-bit range
+const FLOOR_HI: i32 = 16; // the old 12-bit limit, 1/4096
+const FLOOR_DECAY: i32 = 12; // tally half-life, in bits, is about 2^FLOOR_DECAY
+
+/// -log2(p / 65536) in 1/65536-bit units, for p in 1..65535. The fine unit
+/// matters: the savings being tallied are thousandths of a bit.
+///
+/// Computed in exact integer arithmetic rather than with `f64::log2`: this table
+/// steers a decision the decoder must reproduce bit for bit, and libm results
+/// may differ in the last place between platforms.
+fn cost_tab() -> &'static [i32] {
+    static T: OnceLock<Vec<i32>> = OnceLock::new();
+    T.get_or_init(|| (0..65536u32).map(|p| (16 << 16) - log2_fx16(p.max(1))).collect())
+}
+
+/// log2(x) in 16.16 fixed point, by repeated squaring of the normalised
+/// mantissa — integer-only, so identical on every platform.
+fn log2_fx16(x: u32) -> i32 {
+    let ip = 31 - x.leading_zeros() as i32;
+    // mantissa in [1, 2) as 2.30 fixed point
+    let mut m: u64 = ((x as u64) << 30) >> ip;
+    let mut frac = 0i32;
+    for bitv in (0..16).rev() {
+        m = (m * m) >> 30;
+        if m >= 2u64 << 30 {
+            m >>= 1;
+            frac |= 1 << bitv;
+        }
+    }
+    (ip << 16) | frac
 }
 
 // ---------------------------------------------------------------------------
@@ -849,16 +932,182 @@ impl<const N: usize> Mixer<N> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bit histories — indirect context modelling.
+//
+// A direct counter answers "what fraction of bits were 1 here", which is the
+// wrong question for data whose statistics drift: a context that saw 0000 and
+// then 11 is far more likely to emit a 1 next than its 1/3 average suggests.
+// A bit history keeps the *shape* of recent evidence instead — a small state
+// encoding (n0, n1, last bit) under a nonstationary update that discounts the
+// opposing count whenever a bit arrives — and a StateMap learns, per model, what
+// each shape actually predicts on this file. That learned indirection is the
+// core of what makes paq/zpaq strong on prose and binaries.
+//
+// The state set is generated, not tabulated: a breadth-first walk from (0,0)
+// under the update rule enumerates every reachable state, which comes to well
+// under 256, so a state fits in a byte.
+// ---------------------------------------------------------------------------
+
+struct StateTab {
+    next: [[u8; 2]; 256],
+    n0: [u8; 256],
+    n1: [u8; 256],
+}
+
+/// Highest count a state may hold on one side, given the count on the other.
+/// Lopsided histories get the most resolution: "seen forty 1s, no 0s" is a
+/// common and very sharp situation, and two large counts never coexist under
+/// the discounting rule anyway.
+fn hist_cap(other: u32) -> u32 {
+    const LIM: [u32; 9] = [48, 24, 12, 8, 6, 5, 4, 4, 3];
+    LIM[(other as usize).min(LIM.len() - 1)]
+}
+
+/// Nonstationary discount of the count opposing a fresh bit.
+fn hist_discount(n: u32) -> u32 {
+    if n <= 2 {
+        n
+    } else if n < 8 {
+        2 + (n - 2) / 2
+    } else {
+        n / 3 + 1
+    }
+}
+
+fn hist_next(s: (u32, u32, u32), y: u32) -> (u32, u32, u32) {
+    let (mut n0, mut n1, _) = s;
+    if y == 1 {
+        n1 = (n1 + 1).min(hist_cap(n0));
+        n0 = hist_discount(n0);
+    } else {
+        n0 = (n0 + 1).min(hist_cap(n1));
+        n1 = hist_discount(n1);
+    }
+    // the last bit only carries information while both sides are small
+    let last = if n0 > 0 && n1 > 0 && n0 + n1 <= 8 { y } else { 0 };
+    (n0, n1, last)
+}
+
+fn state_tab() -> &'static StateTab {
+    static T: OnceLock<StateTab> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut ids: Vec<(u32, u32, u32)> = vec![(0, 0, 0)];
+        let mut next = [[0u8; 2]; 256];
+        let mut i = 0;
+        while i < ids.len() {
+            for y in 0..2 {
+                let t = hist_next(ids[i], y);
+                let j = match ids.iter().position(|&s| s == t) {
+                    Some(j) => j,
+                    None => {
+                        ids.push(t);
+                        ids.len() - 1
+                    }
+                };
+                next[i][y as usize] = j as u8;
+            }
+            i += 1;
+        }
+        assert!(ids.len() <= 256, "bit-history state set overflowed a byte");
+        let mut t = StateTab { next, n0: [0; 256], n1: [0; 256] };
+        for (k, &(a, b, _)) in ids.iter().enumerate() {
+            t.n0[k] = a as u8;
+            t.n1[k] = b as u8;
+        }
+        t
+    })
+}
+
+/// state -> learned P(1), one row per model. Wide slots with a long count: what a
+/// given history predicts is a property of the file, so it should settle.
+const SM_LIMIT: u32 = 1023;
+
+fn sm_init(st: &StateTab) -> Vec<u32> {
+    (0..256)
+        .map(|s| {
+            let (n0, n1) = (st.n0[s] as u64, st.n1[s] as u64);
+            let p22 = (((2 * n1 + 1) << 22) / (2 * (n0 + n1) + 2)) as u32;
+            p22.min((1 << 22) - 1) << 10
+        })
+        .collect()
+}
+
+#[inline]
+fn sm_update(v: u32, bit: u32) -> u32 {
+    let n = v & 1023;
+    let p22 = (v >> 10) as i32;
+    let rate = unsafe { *RATE_TAB.get_unchecked(n as usize) };
+    let err = (((bit as i32) << 22) - p22) as i64;
+    let p22 = (p22 + ((err * rate as i64) >> 16) as i32).clamp(0, (1 << 22) - 1) as u32;
+    let n = if n < SM_LIMIT { n + 1 } else { n };
+    (p22 << 10) | n
+}
+
+// ---------------------------------------------------------------------------
+// Context slots.
+//
+// One slot holds everything a context knows about one *nibble*: the fifteen
+// nodes of the 4-bit binary tree, each with a direct counter and a bit history,
+// behind a 16-bit checksum. Two consequences:
+//
+//   - a collision is detected instead of silently blending two contexts'
+//     statistics, and the slot with less evidence is the one evicted;
+//   - a model touches one cache line per nibble rather than one per bit.
+//
+// A slot is exactly one 64-byte line. Lookups are two-way: a context may live
+// in either of an adjacent pair, which the hardware prefetcher usually pulls in
+// together.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Slot {
+    chk: u16,
+    st: [u8; 15],
+    _pad: u8,
+    ctr: [u16; 15],
+    // run map (byte-start slots only): the last byte seen in this context, and
+    // how many times in a row it has been that byte
+    rb: u8,
+    rn: u8,
+    _spare: [u8; 14],
+}
+
+const SLOT_EMPTY: Slot =
+    Slot { chk: 0, st: [0; 15], _pad: 0, ctr: [CTR_INIT; 15], rb: 0, rn: 0, _spare: [0; 14] };
+
+#[inline]
+fn slot_hash(ctx: u32, nib: u32, m: usize) -> u64 {
+    // splitmix64 finaliser: index from the high bits, checksum from the low,
+    // so the two are effectively independent
+    let mut x = ((ctx as u64) << 32) ^ ((nib as u64) << 8) ^ (m as u64) ^ 0x9e37_79b9_7f4a_7c15;
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
 struct Predictor {
     buf: Vec<u8>,
-    t: Vec<u16>, // NTAB context tables, flattened: model m occupies [m<<mem_bits ..]
-    mem_bits: usize,
-    mask: usize,
+    slots: Vec<Slot>, // one pool shared by every context model
+    slot_bits: usize,
+    cur: [usize; NTAB], // slot each model is reading for the current nibble
+    node: usize,        // node of the nibble tree for the current bit (0..15)
+    seen: u32,          // bit m set: model m's slot already existed (not freshly claimed)
+    cur0: [usize; NTAB], // byte-start slot per model, where its run map lives
+    chk0: [u16; NTAB],
+    run_byte: u8,
+    run_cx: u32, // (order rank, run length bucket), or u32::MAX when no run applies
+    trust_run: TrustMap,
+    sm: Vec<u32>,       // StateMaps: NTAB rows of 256
+    stt: &'static StateTab,
     // SSE stages, applied to the mixer output in sequence
     apm_c0: Apm,
     apm_o1: Apm,
     apm_str: Apm,
     apm_ora: Apm,
+    floor_tally: i64, // decayed (cost with floor LO) - (cost with floor HI)
+    p_raw: i32,       // the unfloored final probability, for the tally
     // bit-assembly state
     c0: u32,
     bitpos: u32,
@@ -873,7 +1122,15 @@ struct Predictor {
     stride: StrideDetect,
     // word model state (format-independent: words matter in prose, JSON keys and logs alike)
     word_hash: u32,
+    line_start: usize, // buffer offset of the current line's first byte
+    img: Option<ImgGeom>, // set when coding the residuals of a raw 16-bit image
+    ind1: Vec<u16>, // byte -> the last two bytes that followed it
+    shape: u32,     // 2-bit class per recent byte: letter / digit / space / other
+    fshape: u32,    // 3-bit finer class per recent byte (case, punctuation, control, high bit)
+    ind2: Vec<u16>, // byte pair -> the last two bytes that followed it
+    prev_line: usize,  // ... and of the line before it
     prev_word: u32,
+    prev_word2: u32,
     // streaming JSON parser
     in_str: bool,
     esc: bool,
@@ -941,7 +1198,6 @@ struct Predictor {
     mix2: Mixer<NMIX>,
     m1out: [i32; NMIX],
     // cached for update()
-    idx: [usize; NTAB],
     st: [i32; NIN],
     mix2out: i32, // layer-2 stretched output — what the SSE chain refines
 }
@@ -950,13 +1206,24 @@ impl Predictor {
     fn new(mode: Mode, mem_bits: usize) -> Self {
         let mut p = Self {
             buf: Vec::new(),
-            t: vec![CTR_INIT; NTAB << mem_bits],
-            mem_bits,
-            mask: (1 << mem_bits) - 1,
+            slots: vec![SLOT_EMPTY; 1 << (mem_bits + POOL_DELTA)],
+            slot_bits: mem_bits + POOL_DELTA,
+            cur: [0; NTAB],
+            node: 0,
+            seen: 0,
+            cur0: [0; NTAB],
+            chk0: [0; NTAB],
+            run_byte: 0,
+            run_cx: u32::MAX,
+            trust_run: TrustMap::with_size(1 << 12),
+            sm: (0..NTAB).flat_map(|_| sm_init(state_tab())).collect(),
+            stt: state_tab(),
             apm_c0: Apm::new(8),
             apm_o1: Apm::new(16),
             apm_str: Apm::new(16),
             apm_ora: Apm::new(14),
+            floor_tally: 0,
+            p_raw: 32768,
             c0: 1,
             bitpos: 0,
             ctxh: [0; NTAB],
@@ -969,7 +1236,15 @@ impl Predictor {
             trust_num: TrustMap::new(),
             stride: StrideDetect::new(),
             word_hash: 0,
+            line_start: 0,
+            img: None,
+            ind1: vec![0; 256],
+            shape: 0,
+            fshape: 0,
+            ind2: vec![0; 65536],
+            prev_line: 0,
             prev_word: 0,
+            prev_word2: 0,
             in_str: false,
             esc: false,
             str_is_key: false,
@@ -1028,12 +1303,75 @@ impl Predictor {
             mix1: MIX_CTX_BITS.iter().map(|&b| Mixer::new(b)).collect(),
             mix2: Mixer::new(8),
             m1out: [0; NMIX],
-            idx: [0; NTAB],
             st: [0; NIN],
             mix2out: 0,
         };
         p.recompute_ctx();
+        p.select_slots();
         p
+    }
+
+    /// Code an image residual stream: swaps the text-only contexts for
+    /// neighbourhood ones. Must be called before the first bit.
+    fn set_image(&mut self, img: Option<ImgGeom>) {
+        if img.is_none() {
+            return; // already configured; re-selecting would mark fresh slots as seen
+        }
+        // undo the first nibble's claims so they are made under image contexts
+        for m in 0..NTAB {
+            self.slots[self.cur[m]] = SLOT_EMPTY;
+        }
+        self.img = img;
+        self.recompute_ctx();
+        self.select_slots();
+    }
+
+    /// Image residual contexts. A residual's size is best predicted by its
+    /// neighbours' sizes — busy regions stay busy — and once the low byte is
+    /// known, it pins the high byte down almost completely.
+    fn image_ctx(&mut self, g: ImgGeom) {
+        let n = self.buf.len();
+        if n < g.parity {
+            return;
+        }
+        let k = n - g.parity;
+        let (s, phase) = (k / 2, (k & 1) as u32);
+        let w = g.width;
+        let x = s % w;
+        let r = |i: usize| u16::from_le_bytes([self.buf[g.parity + 2 * i], self.buf[g.parity + 2 * i + 1]]) as u32;
+        let q = |v: u32| 32 - v.leading_zeros();
+        let rw = if x > 0 { r(s - 1) } else { 0 };
+        let rww = if x > 1 { r(s - 2) } else { 0 };
+        let (rn, rnw, rne, rnn) = if s >= w {
+            (
+                r(s - w),
+                if x > 0 { r(s - w - 1) } else { 0 },
+                if x + 1 < w { r(s - w + 1) } else { 0 },
+                if s >= 2 * w { r(s - 2 * w) } else { 0 },
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
+        let lo = if phase == 1 { self.buf[n - 1] as u32 } else { 0x100 };
+        let h = |tag: u32, a: u32, b: u32| {
+            (tag.wrapping_mul(0x9e37_79b1) ^ a.wrapping_mul(0x85eb_ca6b) ^ b.wrapping_mul(0xc2b2_ae35))
+                .wrapping_add(phase.wrapping_mul(0x27d4_eb2f))
+        };
+        let busy = q(rw + rn + (rnw + rne) / 2);
+        let mx = q(rw.max(rn).max(rnw).max(rne));
+        let c = [
+            h(1, busy, lo),
+            h(2, q(rw) << 5 | q(rn), lo),
+            h(3, q(rne) << 10 | q(rnw) << 5 | q(rww), lo >> 2),
+            h(4, (rw & 0xff) << 5 | q(rn), lo),
+            h(5, ((x >> 4) as u32) << 5 | q(rn), lo >> 4),
+            h(6, q(rn) << 5 | q(rnn), lo),
+            h(7, mx, lo >> 4),
+        ];
+        let slots = [WORD0, WORD0 + 1, WORD0 + 2, WORD0 + 3, SHAPE0, SHAPE0 + 1, SHAPE0 + 2];
+        for (j, &m) in slots.iter().enumerate() {
+            self.ctxh[m] = c[j];
+        }
     }
 
     #[inline]
@@ -1061,6 +1399,13 @@ impl Predictor {
         self.ctxh[WORD0] = self.word_hash.wrapping_mul(0xa24b_af05);
         self.ctxh[WORD0 + 1] =
             self.word_hash ^ self.prev_word.wrapping_mul(0x7feb_352d);
+        self.ctxh[WORD0 + 2] = self.word_hash
+            ^ self.prev_word.wrapping_mul(0x2545_f491)
+            ^ self.prev_word2.wrapping_mul(0x6c8e_9cf5);
+        // skip-gram: the word two back, without the one between — "the ... of"
+        self.ctxh[WORD0 + 3] = self.word_hash.wrapping_mul(0x9e37_79b1)
+            ^ self.prev_word2.wrapping_mul(0x85eb_ca6b)
+            ^ 0x5c1b_0003;
         // record-stride contexts: the byte one record above, and the pair one and
         // two records above — the vertical equivalent of order-1 and order-2.
         // Sparse contexts skip a byte, which catches interleaved fields (a
@@ -1079,6 +1424,29 @@ impl Predictor {
         }
         self.ctxh[BIN0 + 2] = b(1).wrapping_mul(0x2545_f491) ^ b(3).wrapping_mul(0x9e37_79b1);
         self.ctxh[BIN0 + 3] = b(2).wrapping_mul(0x7feb_352d) ^ b(4).wrapping_mul(0x846c_a68b);
+        // text columns: the byte directly above in the previous line, alone and
+        // with the byte to our left. Indented source, aligned logs and
+        // fixed-width reports repeat vertically where no byte context sees it.
+        let col = n - self.line_start;
+        let above = if self.prev_line + col < self.line_start {
+            self.buf[self.prev_line + col] as u32
+        } else {
+            0x100 // previous line is shorter than this column
+        };
+        let colb = col.min(255) as u32;
+        // shape: the class pattern of the last eight bytes, with the last byte
+        // itself — "a number, then a space, then letters" is a strong frame
+        self.ctxh[SHAPE0] = (self.shape & 0xffff).wrapping_mul(0x2545_f491) ^ b(1).wrapping_mul(0x9e37_79b1) ^ 0x5ea9_0001;
+        self.ctxh[SHAPE0 + 1] = self.shape.wrapping_mul(0x6c8e_9cf5) ^ 0x5ea9_0002;
+        self.ctxh[SHAPE0 + 2] = (self.fshape & 0xff_ffff).wrapping_mul(0x85eb_ca6b) ^ 0x5ea9_0003;
+        // indirect: "after `q` the last two times came `ue`" predicts better than `q`
+        let c1 = b(1);
+        let c2 = c1 | b(2) << 8;
+        self.ctxh[IND0] = (c1 | (self.ind1[c1 as usize] as u32) << 8).wrapping_mul(0x9e37_79b1) ^ 0x1d1d_0001;
+        self.ctxh[IND0 + 1] =
+            c2.wrapping_mul(0x85eb_ca6b) ^ (self.ind2[c2 as usize] as u32).wrapping_mul(0xc2b2_ae35) ^ 0x1d1d_0002;
+        self.ctxh[COL0] = above.wrapping_mul(0x6c8e_9cf5) ^ colb.wrapping_mul(0x9e37_79b1) ^ 0x7a7a_0001;
+        self.ctxh[COL0 + 1] = above.wrapping_mul(0x2545_f491) ^ b(1).wrapping_mul(0x85eb_ca6b) ^ 0x7a7a_0002;
         // structure context: (field identity, secondary axis) per format
         let last = *self.buf.last().unwrap_or(&0) as u32;
         let (field, aux) = match self.mode {
@@ -1104,42 +1472,32 @@ impl Predictor {
         self.ctxh[STR0 + 1] = field.wrapping_mul(0x9e37_79b1)
             ^ aux.wrapping_mul(0x27d4_eb2f)
             ^ last.wrapping_mul(0x1656_67b1);
+        if let Some(g) = self.img {
+            self.image_ctx(g);
+        }
     }
 
     #[inline]
     fn predict(&mut self) -> u32 {
         let stab = stretch_tab();
+        let node = self.node;
         for m in 0..NTAB {
-            let local = (self.ctxh[m] ^ self.c0.wrapping_mul(2_654_435_761)) as usize & self.mask;
-            let flat = (m << self.mem_bits) | local; // local < 2^mem_bits, so this is m*stride+local
-            self.idx[m] = flat;
-            // SAFETY: flat < NTAB<<mem_bits = t.len(); ctr_p12 < 4096 = stretch_tab.len()
-            let tv = unsafe { *self.t.get_unchecked(flat) };
-            self.st[m] = unsafe { *stab.get_unchecked(ctr_p12(tv)) };
-        }
-        // Start both candidate loads for the next bit. Skipped on the last bit of
-        // a byte, where the byte boundary rewrites every context hash and the
-        // addresses are not yet knowable.
-        if self.c0 < 128 {
-            let base = self.t.as_ptr();
-            let (n0, n1) = (self.c0 << 1, (self.c0 << 1) | 1);
-            for m in 0..NTAB {
-                let stride = m << self.mem_bits;
-                let h0 = (self.ctxh[m] ^ n0.wrapping_mul(2_654_435_761)) as usize & self.mask;
-                let h1 = (self.ctxh[m] ^ n1.wrapping_mul(2_654_435_761)) as usize & self.mask;
-                // SAFETY: both offsets are < NTAB<<mem_bits = t.len(); prefetch of
-                // an in-bounds address has no architectural effect regardless.
-                unsafe {
-                    prefetch(base.add(stride | h0));
-                    prefetch(base.add(stride | h1));
-                }
-            }
+            // SAFETY: cur[m] < slots.len() by construction in select_slots; node < 15
+            let sl = unsafe { self.slots.get_unchecked(self.cur[m]) };
+            let (cv, hs) = unsafe { (*sl.ctr.get_unchecked(node), *sl.st.get_unchecked(node)) };
+            let sp = unsafe { *self.sm.get_unchecked((m << 8) | hs as usize) };
+            self.st[m] = unsafe { *stab.get_unchecked(ctr_p12(cv)) };
+            self.st[NTAB + m] = unsafe { *stab.get_unchecked(wide_p12(sp)) };
+            // deterministic histories (every bit so far agreed) get their own
+            // channel, so the mixer can trust "never contradicted" separately
+            let det = (self.stt.n0[hs as usize] == 0) != (self.stt.n1[hs as usize] == 0);
+            self.st[2 * NTAB + m] = if det { self.st[NTAB + m] } else { 0 };
         }
         // Oracles: each names an expected bit; a TrustMap turns that into a
         // probability whose confidence was learned from how often this oracle has
         // been right in this situation, rather than assumed.
         for i in 0..NMATCH {
-            self.st[NTAB + i] = match self.matches[i].expected(self.c0, self.bitpos) {
+            self.st[ORA0 + i] = match self.matches[i].expected(self.c0, self.bitpos) {
                 Some(eb) => {
                     let cx = trust_cx(lenbucket(self.matches[i].len), self.bitpos, eb);
                     self.trust_match[i].predict(cx)
@@ -1152,7 +1510,7 @@ impl Predictor {
         }
         // record-history model: bucket by how much of this value has replayed,
         // offset by the field's historical reliability
-        self.st[NTAB + NMATCH] = match self.rec_expected(self.c0, self.bitpos) {
+        self.st[ORA0 + NMATCH] = match self.rec_expected(self.c0, self.bitpos) {
             Some(eb) => {
                 // "how far in am I" and "is this field usually repetitive" are
                 // different questions; summing them would blur both
@@ -1167,13 +1525,26 @@ impl Predictor {
             }
         };
         // numeric model
-        self.st[NTAB + NMATCH + NREC] = match self.np_expected() {
+        self.st[ORA0 + NMATCH + NREC] = match self.np_expected() {
             Some(eb) => {
                 let cx = trust_cx(lenbucket(self.num_hits), self.bitpos, eb);
                 self.trust_num.predict(cx)
             }
             None => {
                 self.trust_num.idle();
+                0
+            }
+        };
+
+        // run map: same oracle shape as the match model, one byte at a time
+        self.st[ORA0 + NMATCH + NREC + 1] = {
+            let placed = self.c0 - (1 << self.bitpos);
+            let rb = self.run_byte as u32;
+            if self.run_cx != u32::MAX && (self.bitpos == 0 || placed == rb >> (8 - self.bitpos)) {
+                let eb = (rb >> (7 - self.bitpos)) & 1;
+                self.trust_run.predict(((self.run_cx as usize) << 4) | ((self.bitpos as usize) << 1) | eb as usize)
+            } else {
+                self.trust_run.idle();
                 0
             }
         };
@@ -1203,12 +1574,14 @@ impl Predictor {
             | ((self.bitpos as usize) << 4)
             | (self.c0 as usize & 15);
 
-        let p = squash(self.mix2out).clamp(1, 4095);
+        let p = squash(self.mix2out).clamp(1, 4095) << 4;
         let p = (self.apm_c0.refine(p, self.c0 as usize) * 3 + p) >> 2;
         let p = (self.apm_o1.refine(p, o1cx >> 8) * 3 + p) >> 2;
         let p = (self.apm_str.refine(p, strcx >> 8) * 3 + p) >> 2;
         let p = (self.apm_ora.refine(p, oracx) * 3 + p) >> 2;
-        p.clamp(1, 4095) as u32
+        self.p_raw = p;
+        let floor = if self.floor_tally < 0 { FLOOR_LO } else { FLOOR_HI };
+        p.clamp(floor, 65536 - floor) as u32
     }
 
     /// Weight-set selector for each layer-1 mixer. Each is a different view of
@@ -1226,6 +1599,12 @@ impl Predictor {
             last as usize,
             (mstate << 3) | self.bitpos as usize,
             (self.ctxh[STR0] ^ self.c0.wrapping_mul(0x9e37_79b1)) as usize,
+            {
+                let eff = (self.seen >> 1 & ((1 << ORDERS.len()) - 1)).count_ones() as usize;
+                let word = (self.seen >> WORD0 & 1) as usize;
+                let strc = (self.seen >> (STR0 + 2) & 1) as usize;
+                (eff << 5) | (word << 4) | (strc << 3) | self.bitpos as usize
+            },
         ]
     }
 
@@ -1236,20 +1615,37 @@ impl Predictor {
         self.apm_o1.update(bit, APM_RATE);
         self.apm_str.update(bit, APM_RATE);
         self.apm_ora.update(bit, APM_RATE);
+        {
+            let ct = cost_tab();
+            let cost = |f: i32| {
+                let p = self.p_raw.clamp(f, 65536 - f);
+                ct[(if bit == 1 { p } else { 65536 - p }) as usize]
+            };
+            let d = (cost(FLOOR_LO) - cost(FLOOR_HI)) as i64;
+            self.floor_tally += d - (self.floor_tally >> FLOOR_DECAY);
+        }
         for tm in &mut self.trust_match {
             tm.update(bit);
         }
         self.trust_rec.update(bit);
         self.trust_num.update(bit);
+        self.trust_run.update(bit);
         self.mix2.update(&self.m1out, self.mix2out, bit);
         for j in 0..NMIX {
             let out = self.m1out[j];
             self.mix1[j].update(&self.st, out, bit);
         }
-        // context table updates
+        // context updates: the node's counter, its bit history, and the StateMap
+        // cell that history was read through
+        let node = self.node;
         for m in 0..NTAB {
-            let cell = unsafe { self.t.get_unchecked_mut(self.idx[m]) };
-            *cell = ctr_update(*cell, bit, CLIMIT);
+            let sl = unsafe { self.slots.get_unchecked_mut(self.cur[m]) };
+            let c = unsafe { sl.ctr.get_unchecked_mut(node) };
+            *c = ctr_update(*c, bit, CLIMIT);
+            let h = unsafe { sl.st.get_unchecked_mut(node) };
+            let smc = unsafe { self.sm.get_unchecked_mut((m << 8) | *h as usize) };
+            *smc = sm_update(*smc, bit);
+            *h = self.stt.next[*h as usize][bit as usize];
         }
         self.c0 = (self.c0 << 1) | bit;
         self.bitpos += 1;
@@ -1259,9 +1655,142 @@ impl Predictor {
             self.c0 = 1;
             self.bitpos = 0;
         }
+        if self.bitpos == 0 || self.bitpos == 4 {
+            self.select_slots();
+        } else {
+            // node index within the nibble tree: 1 + 2 + 4 + 8 nodes, heap-ordered
+            let k = self.bitpos & 3;
+            self.node = ((1usize << k) - 1) + (self.c0 as usize & ((1 << k) - 1));
+            if k == 3 && self.bitpos == 3 {
+                // the next nibble's slot is one of two; start both loads now
+                self.prefetch_slots();
+            }
+        }
+    }
+
+    /// Nibble context for the slot lookup: none at a byte start, the high
+    /// nibble (with its leading 1) halfway through.
+    #[inline]
+    fn slot_index(&self, m: usize, nib: u32) -> (usize, u16) {
+        let h = slot_hash(self.ctxh[m], nib, m);
+        // the model index is part of the hash, so models share the pool
+        // without sharing contexts
+        let i = ((h >> (64 - self.slot_bits)) as usize) & !1;
+        (i, h as u16)
+    }
+
+    fn prefetch_slots(&self) {
+        let base = self.slots.as_ptr();
+        for m in 0..NTAB {
+            for y in 0..2 {
+                let (i, _) = self.slot_index(m, (self.c0 << 1) | y);
+                // SAFETY: i < slots.len(); a prefetch has no architectural effect
+                unsafe { prefetch(base.add(i) as *const u16) };
+            }
+        }
+    }
+
+    /// Find (or claim) each model's slot for the nibble about to be coded.
+    fn select_slots(&mut self) {
+        let nib = if self.bitpos == 0 { 0 } else { self.c0 };
+        self.node = 0;
+        self.seen = 0;
+        // compute every address and start every load before touching any of
+        // them, so the misses overlap instead of queueing behind each compare
+        let mut at = [(0usize, 0u16); NTAB];
+        let base = self.slots.as_ptr();
+        for m in 0..NTAB {
+            at[m] = self.slot_index(m, nib);
+            // SAFETY: index < slots.len(); a prefetch has no architectural effect
+            unsafe { prefetch(base.add(at[m].0) as *const u16) };
+        }
+        for m in 0..NTAB {
+            let (i, chk) = at[m];
+            let pick = if self.slots[i].chk == chk {
+                self.seen |= 1 << m;
+                i
+            } else if self.slots[i + 1].chk == chk {
+                self.seen |= 1 << m;
+                i + 1
+            } else {
+                // evict whichever pair member has the thinner root history
+                let w = |sl: &Slot| self.stt.n0[sl.st[0] as usize] as u32 + self.stt.n1[sl.st[0] as usize] as u32;
+                let v = if w(&self.slots[i]) <= w(&self.slots[i + 1]) { i } else { i + 1 };
+                self.slots[v] = Slot { chk, ..SLOT_EMPTY };
+                v
+            };
+            self.cur[m] = pick;
+        }
+        if self.bitpos == 0 {
+            self.run_cx = u32::MAX;
+            for m in 0..NTAB {
+                self.cur0[m] = self.cur[m];
+                self.chk0[m] = self.slots[self.cur[m]].chk;
+            }
+            // the longest byte order still repeating itself speaks for the run map
+            for r in (0..ORDERS.len()).rev() {
+                let m = 1 + r;
+                let sl = &self.slots[self.cur[m]];
+                if self.seen >> m & 1 == 1 && sl.rn > 0 {
+                    self.run_byte = sl.rb;
+                    self.run_cx = ((r as u32) << 4) | lenbucket(sl.rn as u32).min(15);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Fold the byte just coded into every model's run map.
+    fn update_runs(&mut self, byte: u8) {
+        for m in 0..NTAB {
+            let sl = &mut self.slots[self.cur0[m]];
+            if sl.chk != self.chk0[m] {
+                continue; // evicted by this byte's second-nibble lookup
+            }
+            if sl.rn > 0 && sl.rb == byte {
+                sl.rn = sl.rn.saturating_add(1);
+            } else {
+                sl.rb = byte;
+                sl.rn = 1;
+            }
+        }
     }
 
     fn byte_boundary(&mut self, byte: u8) {
+        self.update_runs(byte);
+        let class = if byte.is_ascii_alphabetic() {
+            0
+        } else if byte.is_ascii_digit() {
+            1
+        } else if byte == b' ' || byte == b'\n' || byte == b'\t' {
+            2
+        } else {
+            3
+        };
+        self.shape = (self.shape << 2) | class;
+        let fine = match byte {
+            b'a'..=b'z' => 0,
+            b'A'..=b'Z' => 1,
+            b'0'..=b'9' => 2,
+            b' ' => 3,
+            b'\n' | b'\r' | b'\t' => 4,
+            0x21..=0x2f | 0x3a..=0x40 | 0x5b..=0x60 | 0x7b..=0x7e => 5,
+            0x80..=0xff => 6,
+            _ => 7, // other control bytes, NUL included
+        };
+        self.fshape = (self.fshape << 3) | fine;
+        // --- indirect histories: record what followed the last one and two bytes ---
+        {
+            let n = self.buf.len();
+            if n >= 1 {
+                let c1 = self.buf[n - 1] as usize;
+                self.ind1[c1] = (self.ind1[c1] << 8) | byte as u16;
+                if n >= 2 {
+                    let c2 = c1 | (self.buf[n - 2] as usize) << 8;
+                    self.ind2[c2] = (self.ind2[c2] << 8) | byte as u16;
+                }
+            }
+        }
         // --- match models ---
         self.buf.push(byte);
         for m in &mut self.matches {
@@ -1273,11 +1802,17 @@ impl Predictor {
         // --- record model: consume the byte before the parser can re-aim it ---
         self.rec_advance(byte);
 
+        if byte == b'\n' {
+            self.prev_line = self.line_start;
+            self.line_start = self.buf.len();
+        }
+
         // --- word model: accumulate a token, retire it at the first separator ---
         if byte.is_ascii_alphanumeric() {
             // fold case so "The" and "the" share statistics
             self.word_hash = hstep(self.word_hash, byte | 0x20);
         } else if self.word_hash != 0 {
+            self.prev_word2 = self.prev_word;
             self.prev_word = self.word_hash;
             self.word_hash = 0;
         }
@@ -2348,14 +2883,221 @@ fn e8e9_helps(data: &[u8], mode: Mode) -> bool {
 //   "AUGR" | version(1) | mode(1) | mem_bits(1) | flags(1) | orig_len(8, LE) | stream
 // mem_bits is stored rather than derived so the decoder builds byte-identical
 // tables even if the sizing heuristic is retuned in a later release.
+// ---------------------------------------------------------------------------
+// Raw 16-bit images.
+//
+// Medical scans, astronomy frames, sensor dumps: little-endian 16-bit samples
+// in raster order, often behind a header nothing here parses. Byte contexts see
+// noise — the low byte of a pixel carries most of the entropy and looks random
+// on its own — but the pixel is very nearly predictable from its neighbours to
+// the left and above. As with audio, augur predicts each sample from ones the
+// decoder will already have, and hands the CM the residual instead.
+//
+// The geometry is found, not parsed: the row width is the lag at which samples
+// best predict each other vertically, and the byte parity is whichever
+// alignment makes adjacent samples close. A trial encode has the final say.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct ImgGeom {
+    width: usize, // samples per row
+    parity: usize, // byte offset of the first sample (0 or 1)
+}
+
+const IMG_MAX_WIDTH: usize = 8192;
+
+fn img_detect(data: &[u8]) -> Option<ImgGeom> {
+    const PROBE: usize = 1 << 17; // samples examined
+    if data.len() < 4 * PROBE {
+        return None;
+    }
+    let mid = (data.len() / 2) & !1;
+    let samples = |par: usize| -> Vec<i32> {
+        (0..PROBE).map(|i| u16::from_le_bytes([data[mid + par + 2 * i], data[mid + par + 2 * i + 1]]) as i32).collect()
+    };
+    let err = |v: &[i32], w: usize| -> u64 {
+        (IMG_MAX_WIDTH..v.len()).step_by(7).map(|i| (v[i] - v[i - w]).unsigned_abs() as u64).sum()
+    };
+    let (e0, e1) = (err(&samples(0), 1), err(&samples(1), 1));
+    // a true 16-bit stream makes one alignment far smoother than the other
+    let parity = if e0 * 4 < e1 {
+        0
+    } else if e1 * 4 < e0 {
+        1
+    } else {
+        return None;
+    };
+    let v = samples(parity);
+    let eh = e0.min(e1);
+    let (ev, width) = (8..=IMG_MAX_WIDTH).map(|w| (err(&v, w), w)).min()?;
+    // an image row predicts about as well as the left neighbour does; a 1-D
+    // signal (audio, a counter) has nothing comparable at any long lag
+    if ev * 4 > eh * 5 {
+        return None;
+    }
+    Some(ImgGeom { width, parity })
+}
+
+/// LOCO-I median edge detector: picks W or N across an edge, the planar
+/// estimate W + N - NW inside smooth regions.
+#[inline]
+fn med_predict(w: i32, n: i32, nw: i32) -> i32 {
+    let (lo, hi) = if w < n { (w, n) } else { (n, w) };
+    if nw >= hi {
+        lo
+    } else if nw <= lo {
+        hi
+    } else {
+        w + n - nw
+    }
+}
+
+const NPRED: usize = 10;
+
+/// Candidate predictions for sample i, from its causal neighbourhood. Missing
+/// neighbours (first row/column) fall back to whatever is available.
+#[inline]
+fn img_candidates(px: &[i32], i: usize, w: usize) -> [i32; NPRED] {
+    let x = i % w;
+    let at = |k: Option<usize>, d: i32| k.map(|k| px[k]).unwrap_or(d);
+    let wv = at(i.checked_sub(1).filter(|_| x > 0), 0);
+    let n = at(i.checked_sub(w), wv);
+    let wv = if x > 0 { wv } else { n };
+    let nw = at(i.checked_sub(w + 1).filter(|_| x > 0), n);
+    let ne = at(i.checked_sub(w).filter(|_| x + 1 < w).map(|k| k + 1), n);
+    let ww = at(i.checked_sub(2).filter(|_| x > 1), wv);
+    let nn = at(i.checked_sub(2 * w), n);
+    let nne = at(i.checked_sub(2 * w).filter(|_| x + 1 < w).map(|k| k + 1), ne);
+    [
+        wv,
+        n,
+        nw,
+        ne,
+        med_predict(wv, n, nw),
+        wv + ne - n,
+        (wv + n + 1) >> 1,
+        n + ne - nne,
+        2 * wv - ww,
+        2 * n - nn,
+    ]
+}
+
+/// Replace each sample with its zigzagged prediction residual (forward), or
+/// rebuild samples from residuals (inverse). Bytes before `parity` and a
+/// trailing odd byte pass through untouched.
+///
+/// The prediction blends NPRED candidates, each weighted by the inverse square
+/// of the error it made at the four causal neighbours — so near an edge the
+/// predictor that respects the edge takes over, and in smooth regions the
+/// planar ones do. All integer, so the decoder reproduces it exactly.
+fn img_transform(data: &mut [u8], g: ImgGeom, forward: bool) {
+    let n = (data.len() - g.parity) / 2;
+    let w = g.width;
+    let body = &mut data[g.parity..g.parity + 2 * n];
+    let mut px = vec![0i32; n]; // reconstructed sample values
+    // per-sample absolute error of each candidate, for the neighbours' sake
+    let mut perr = vec![[0u16; NPRED]; n];
+    // bias cancellation: running error sum and count per texture context
+    let mut bias = vec![(0i64, 0i64); 3 * 3 * 3 * 16];
+    for i in 0..n {
+        let x = i % w;
+        let cand = img_candidates(&px, i, w);
+        // error at W, N, NW, NE (those that exist)
+        let mut score = [1u64; NPRED];
+        let mut nb = |k: usize, wgt: u64| {
+            for p in 0..NPRED {
+                score[p] += perr[k][p] as u64 * wgt;
+            }
+        };
+        if x > 0 {
+            nb(i - 1, 2);
+        }
+        if i >= w {
+            nb(i - w, 2);
+            if x > 0 {
+                nb(i - w - 1, 1);
+            }
+            if x + 1 < w {
+                nb(i - w + 1, 1);
+            }
+        }
+        let (mut num, mut den) = (0i128, 0i128);
+        for p in 0..NPRED {
+            let wt = (1u128 << 60) / (score[p] as u128 * score[p] as u128);
+            num += wt as i128 * cand[p] as i128;
+            den += wt as i128;
+        }
+        let pred = ((num + den / 2) / den) as i32;
+        // texture context: the sign pattern of three local gradients, and how
+        // busy the neighbourhood is (the best candidate's recent error)
+        let sg = |d: i32| (d.signum() + 1) as usize;
+        let (wv, nv, nw, ne) = (cand[0], cand[1], cand[2], cand[3]);
+        let act = (64 - score.iter().min().unwrap().leading_zeros()).min(15) as usize;
+        let bcx = ((sg(nv - nw) * 3 + sg(wv - nw)) * 3 + sg(ne - nv)) * 16 + act;
+        let (bs, bc) = bias[bcx];
+        let pred = if bc > 0 { pred + ((bs + bs.signum() * bc / 2) / bc) as i32 } else { pred };
+        let b = [body[2 * i], body[2 * i + 1]];
+        let v = if forward {
+            let v = u16::from_le_bytes(b) as i32;
+            let z = zigzag16(v - pred);
+            body[2 * i..2 * i + 2].copy_from_slice(&z.to_le_bytes());
+            v
+        } else {
+            let v = (pred + unzigzag16(u16::from_le_bytes(b))) as u16 as i32;
+            body[2 * i..2 * i + 2].copy_from_slice(&(v as u16).to_le_bytes());
+            v
+        };
+        px[i] = v;
+        {
+            let e = &mut bias[bcx];
+            e.0 += (v - pred) as i64;
+            e.1 += 1;
+            if e.1 >= 256 {
+                // halve, so the correction tracks the image instead of averaging it
+                e.0 /= 2;
+                e.1 /= 2;
+            }
+        }
+        for p in 0..NPRED {
+            perr[i][p] = (v - cand[p]).unsigned_abs().min(65535) as u16;
+        }
+    }
+}
+
+/// Does the image transform pay on this file? Trial-encode a band of rows.
+fn img_helps(data: &[u8], g: ImgGeom, mode: Mode) -> bool {
+    const SAMPLE: usize = 384 * 1024;
+    let row = 2 * g.width;
+    let rows = (SAMPLE / row).max(16);
+    let start = g.parity + (data.len() / 2 / row) * row;
+    let end = (start + rows * row).min(data.len());
+    if end - start < 8 * row {
+        return false;
+    }
+    let plain = &data[start..end];
+    let mut xf = plain.to_vec();
+    img_transform(&mut xf, ImgGeom { width: g.width, parity: 0 }, true);
+    let mb = mem_bits_for(plain.len());
+    let g0 = Some(ImgGeom { width: g.width, parity: 0 });
+    encode_stream_img(&xf, mode, mb, g0).len() < encode_stream(plain, mode, mb).len()
+}
+
 const MAGIC: [u8; 4] = *b"AUGR";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3; // 3: slot-based contexts, 16-bit coding — not readable by v2 decoders
 const HEADER_LEN: usize = 16;
 const FLAG_E8E9: u8 = 1;
 const FLAG_WAV: u8 = 2;
+/// Raw 16-bit image; the header is followed by width (u32 LE) and parity (u8).
+const FLAG_IMG: u8 = 4;
+const IMG_EXT_LEN: usize = 5;
 
 fn encode_stream(data: &[u8], mode: Mode, mem_bits: usize) -> Vec<u8> {
+    encode_stream_img(data, mode, mem_bits, None)
+}
+
+fn encode_stream_img(data: &[u8], mode: Mode, mem_bits: usize, img: Option<ImgGeom>) -> Vec<u8> {
     let mut pr = Predictor::new(mode, mem_bits);
+    pr.set_image(img);
     let mut enc = Encoder::new();
     for &byte in data {
         for i in (0..8).rev() {
@@ -2368,8 +3110,9 @@ fn encode_stream(data: &[u8], mode: Mode, mem_bits: usize) -> Vec<u8> {
     enc.finish()
 }
 
-fn decode_stream(stream: &[u8], mode: Mode, mem_bits: usize, orig_len: usize) -> Vec<u8> {
+fn decode_stream(stream: &[u8], mode: Mode, mem_bits: usize, orig_len: usize, img: Option<ImgGeom>) -> Vec<u8> {
     let mut pr = Predictor::new(mode, mem_bits);
+    pr.set_image(img);
     let mut dec = Decoder::new(stream);
     let mut out = Vec::with_capacity(orig_len);
     for _ in 0..orig_len {
@@ -2391,6 +3134,7 @@ fn compress(data: &[u8]) -> Vec<u8> {
     let mut flags = 0u8;
     let mut owned;
     let mut body = data;
+    let mut img_geom = None;
     if wav_parse(data).is_some() {
         // 16-bit PCM: predict each sample from its neighbours and code the residual
         let mut t = data.to_vec();
@@ -2399,6 +3143,12 @@ fn compress(data: &[u8]) -> Vec<u8> {
             owned = t;
             body = &owned;
         }
+    } else if let Some(g) = img_detect(data).filter(|&g| mode == Mode::Generic && img_helps(data, g, mode)) {
+        flags |= FLAG_IMG;
+        owned = data.to_vec();
+        img_transform(&mut owned, g, true);
+        body = &owned;
+        img_geom = Some(g);
     } else if mode == Mode::Generic && e8e9_helps(data, mode) {
         // only unstructured data is a plausible carrier for machine code
         flags |= FLAG_E8E9;
@@ -2406,7 +3156,7 @@ fn compress(data: &[u8]) -> Vec<u8> {
         e8e9(&mut owned, true);
         body = &owned;
     }
-    let stream = encode_stream(body, mode, mem_bits);
+    let stream = encode_stream_img(body, mode, mem_bits, img_geom);
     let mut out = Vec::with_capacity(stream.len() + HEADER_LEN);
     out.extend_from_slice(&MAGIC);
     out.push(VERSION);
@@ -2414,6 +3164,10 @@ fn compress(data: &[u8]) -> Vec<u8> {
     out.push(mem_bits as u8);
     out.push(flags);
     out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    if let Some(g) = img_geom {
+        out.extend_from_slice(&(g.width as u32).to_le_bytes());
+        out.push(g.parity as u8);
+    }
     out.extend_from_slice(&stream);
     out
 }
@@ -2433,7 +3187,26 @@ fn decompress(container: &[u8]) -> Result<Vec<u8>, String> {
     }
     let flags = container[7];
     let orig_len = u64::from_le_bytes(container[8..16].try_into().unwrap()) as usize;
-    let mut out = decode_stream(&container[HEADER_LEN..], mode, mem_bits, orig_len);
+    let mut at = HEADER_LEN;
+    let mut img = None;
+    if flags & FLAG_IMG != 0 {
+        if container.len() < HEADER_LEN + IMG_EXT_LEN {
+            return Err("corrupt augur header (truncated image geometry)".into());
+        }
+        let width = u32::from_le_bytes(container[at..at + 4].try_into().unwrap()) as usize;
+        let parity = container[at + 4] as usize;
+        if width == 0 || width > IMG_MAX_WIDTH || parity > 1 {
+            return Err("corrupt augur header (image geometry)".into());
+        }
+        img = Some(ImgGeom { width, parity });
+        at += IMG_EXT_LEN;
+    }
+    let mut out = decode_stream(&container[at..], mode, mem_bits, orig_len, img);
+    if let Some(g) = img {
+        if out.len() > g.parity {
+            img_transform(&mut out, g, false);
+        }
+    }
     if flags & FLAG_E8E9 != 0 {
         e8e9(&mut out, false);
     }
@@ -2449,6 +3222,29 @@ fn main() {
         Some("compress") | Some("c") => cmd_compress(&args[2..]),
         Some("decompress") | Some("d") => cmd_decompress(&args[2..]),
         Some("bench") => cmd_bench(&args[2..]),
+        Some("costs") => {
+            // analysis aid: per-byte coding cost in bits (f32 LE) -> <file>.costs
+            let d = read_or_die(&args[2]);
+            let mut pr = Predictor::new(sniff(&d), mem_bits_for(d.len()));
+            let mut out = Vec::with_capacity(d.len() * 4);
+            for &byte in &d {
+                let mut c = 0f64;
+                for i in (0..8).rev() {
+                    let bit = ((byte >> i) & 1) as u32;
+                    let p = pr.predict() as f64 / 65536.0;
+                    c -= (if bit == 1 { p } else { 1.0 - p }).log2();
+                    pr.update(bit);
+                }
+                out.extend_from_slice(&(c as f32).to_le_bytes());
+            }
+            write_or_die(&format!("{}.costs", args[2]), &out);
+        }
+        Some("size") => {
+            // tuning aid: compressed size only, no decode
+            for f in &args[2..] {
+                println!("{f}\t{}", compress(&read_or_die(f)).len());
+            }
+        }
         _ => {
             eprintln!("augur — structure-aware lossless compressor\n");
             eprintln!("usage:");
@@ -2588,6 +3384,50 @@ mod tests {
                 (x & 0xff) as u8
             })
             .collect()
+    }
+
+    #[test]
+    fn img_transform_is_exactly_invertible_on_adversarial_data() {
+        // random samples make every prediction wrong and force wraparound
+        for &(w, par) in &[(1usize, 0usize), (7, 1), (64, 0), (333, 1)] {
+            let orig = pseudo_random(20_001);
+            let mut t = orig.clone();
+            let g = ImgGeom { width: w, parity: par };
+            img_transform(&mut t, g, true);
+            img_transform(&mut t, g, false);
+            assert!(t == orig, "image transform not invertible (w={w}, parity={par})");
+        }
+    }
+
+    #[test]
+    fn synthetic_image_is_detected_and_roundtrips() {
+        // 12-bit smooth image with noise behind a 101-byte header (odd parity)
+        let (w, h) = (700usize, 520usize);
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut d = vec![0x5au8; 101];
+        for r in 0..h {
+            for c in 0..w {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let v = (2000.0 + 800.0 * ((r as f64) / 60.0).sin() * ((c as f64) / 45.0).cos()) as i32
+                    + (x % 9) as i32
+                    - 4;
+                d.extend_from_slice(&(v as u16).to_le_bytes());
+            }
+        }
+        assert_eq!(img_detect(&d), Some(ImgGeom { width: w, parity: 1 }));
+        let comp = compress(&d);
+        assert!(comp[7] & FLAG_IMG != 0, "image transform should have been chosen");
+        assert!(decompress(&comp).unwrap() == d);
+    }
+
+    #[test]
+    fn integer_log2_matches_float() {
+        for x in [1u32, 2, 3, 5, 100, 4095, 32768, 65535] {
+            let want = (x as f64).log2() * 65536.0;
+            assert!((log2_fx16(x) as f64 - want).abs() <= 2.0, "log2_fx16({x})");
+        }
     }
 
     #[test]

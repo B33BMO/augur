@@ -1,0 +1,290 @@
+{
+  "taxi.csv": {
+    "original_bytes": 19570093,
+    "codecs": [
+      {
+        "codec": "zstd-19",
+        "bytes": 2419753,
+        "enc_s": 7.399001836776733,
+        "dec_s": 0.03345489501953125,
+        "verified": true
+      },
+      {
+        "codec": "zstd-22",
+        "bytes": 2407772,
+        "enc_s": 8.802356243133545,
+        "dec_s": 0.04110407829284668,
+        "verified": true
+      },
+      {
+        "codec": "xz-9e",
+        "bytes": 2326344,
+        "enc_s": 8.549391031265259,
+        "dec_s": 0.14748001098632812,
+        "verified": true
+      },
+      {
+        "codec": "brotli-11",
+        "bytes": 2383942,
+        "enc_s": 28.51598596572876,
+        "dec_s": 0.04797792434692383,
+        "verified": true
+      },
+      {
+        "codec": "zpaq-m5",
+        "bytes": 1649929,
+        "enc_s": 48.42706298828125,
+        "dec_s": null,
+        "verified": null
+      },
+      {
+        "codec": "augur",
+        "bytes": 1405016,
+        "enc_s": 40.2,
+        "dec_s": 40.7,
+        "verified": true,
+        "wall_s": 80.90374398231506
+      }
+    ]
+  },
+  "taxi.none.parquet": {
+    "original_bytes": 4529347,
+    "codecs": [
+      {
+        "codec": "zstd-19",
+        "bytes": 2944187,
+        "enc_s": 0.7422757148742676,
+        "dec_s": 0.017602920532226562,
+        "verified": true
+      },
+      {
+        "codec": "zstd-22",
+        "bytes": 2944187,
+        "enc_s": 1.3793349266052246,
+        "dec_s": 0.0186769962310791,
+        "verified": true
+      },
+      {
+        "codec": "xz-9e",
+        "bytes": 2712996,
+        "enc_s": 0.8751358985900879,
+        "dec_s": 0.12799787521362305,
+        "verified": true
+      },
+      {
+        "codec": "brotli-11",
+        "bytes": 2705972,
+        "enc_s": 12.022877931594849,
+        "dec_s": 0.03892016410827637,
+        "verified": true
+      },
+      {
+        "codec": "zpaq-m5",
+        "bytes": 2451541,
+        "enc_s": 15.622351884841919,
+        "dec_s": null,
+        "verified": null
+      },
+      {
+        "codec": "augur",
+        "bytes": 2447529,
+        "enc_s": 9.6,
+        "dec_s": 9.0,
+        "verified": true,
+        "wall_s": 18.54252791404724
+      }
+    ]
+  },
+  "nginx_logs": {
+    "original_bytes": 6991577,
+    "codecs": [
+      {
+        "codec": "zstd-19",
+        "bytes": 263461,
+        "enc_s": 2.4843430519104004,
+        "dec_s": 0.010348796844482422,
+        "verified": true
+      },
+      {
+        "codec": "zstd-22",
+        "bytes": 263641,
+        "enc_s": 2.9877800941467285,
+        "dec_s": 0.015197277069091797,
+        "verified": true
+      },
+      {
+        "codec": "xz-9e",
+        "bytes": 238496,
+        "enc_s": 2.4338419437408447,
+        "dec_s": 0.03255486488342285,
+        "verified": true
+      },
+      {
+        "codec": "brotli-11",
+        "bytes": 249853,
+        "enc_s": 10.798663854598999,
+        "dec_s": 0.015903949737548828,
+        "verified": true
+      },
+      {
+        "codec": "zpaq-m5",
+        "bytes": 122686,
+        "enc_s": 22.160935163497925,
+        "dec_s": null,
+        "verified": null
+      },
+      {
+        "codec": "augur",
+        "bytes": 123918,
+        "enc_s": 12.9,
+        "dec_s": 13.2,
+        "verified": true,
+        "wall_s": 26.08098816871643
+      }
+    ]
+  },
+  "taxi.ndjson": {
+    "original_bytes": 74961336,
+    "codecs": [
+      {
+        "codec": "zstd-19",
+        "bytes": 2894155,
+        "enc_s": 14.708765983581543,
+        "dec_s": 0.09214305877685547,
+        "verified": true
+      },
+      {
+        "codec": "zstd-22",
+        "bytes": 2793605,
+        "enc_s": 41.415387868881226,
+        "dec_s": 0.09582710266113281,
+        "verified": true
+      },
+      {
+        "codec": "xz-9e",
+        "bytes": 2529652,
+        "enc_s": 32.37344789505005,
+        "dec_s": 0.249467134475708,
+        "verified": true
+      },
+      {
+        "codec": "brotli-11",
+        "bytes": 2740161,
+        "enc_s": 127.880047082901,
+        "dec_s": 0.11660003662109375,
+        "verified": true
+      },
+      {
+        "codec": "zpaq-m5",
+        "bytes": 1842124,
+        "enc_s": 168.63686180114746,
+        "dec_s": null,
+        "verified": null
+      },
+      {
+        "codec": "augur",
+        "bytes": 1517883,
+        "enc_s": 209.6,
+        "dec_s": 192.6,
+        "verified": true,
+        "wall_s": 402.436851978302
+      }
+    ]
+  },
+  "gh_events.ndjson": {
+    "original_bytes": 63960395,
+    "codecs": [
+      {
+        "codec": "zstd-19",
+        "bytes": 4157372,
+        "enc_s": 7.204456090927124,
+        "dec_s": 0.09145307540893555,
+        "verified": true
+      },
+      {
+        "codec": "zstd-22",
+        "bytes": 3622940,
+        "enc_s": 23.505239009857178,
+        "dec_s": 0.07513689994812012,
+        "verified": true
+      },
+      {
+        "codec": "xz-9e",
+        "bytes": 3466628,
+        "enc_s": 15.636663913726807,
+        "dec_s": 0.2575678825378418,
+        "verified": true
+      },
+      {
+        "codec": "brotli-11",
+        "bytes": 3595400,
+        "enc_s": 56.50847411155701,
+        "dec_s": 0.12776970863342285,
+        "verified": true
+      },
+      {
+        "codec": "zpaq-m5",
+        "bytes": 2714433,
+        "enc_s": 151.52991008758545,
+        "dec_s": null,
+        "verified": null
+      },
+      {
+        "codec": "augur",
+        "bytes": 2438617,
+        "enc_s": 145.1,
+        "dec_s": 149.2,
+        "verified": true,
+        "wall_s": 294.38131308555603
+      }
+    ]
+  },
+  "enwik8": {
+    "original_bytes": 100000000,
+    "codecs": [
+      {
+        "codec": "zstd-19",
+        "bytes": 26944223,
+        "enc_s": 24.89664912223816,
+        "dec_s": 0.22738313674926758,
+        "verified": true
+      },
+      {
+        "codec": "zstd-22",
+        "bytes": 25272254,
+        "enc_s": 73.75171208381653,
+        "dec_s": 0.1986691951751709,
+        "verified": true
+      },
+      {
+        "codec": "xz-9e",
+        "bytes": 24831656,
+        "enc_s": 72.59733891487122,
+        "dec_s": 1.0997247695922852,
+        "verified": true
+      },
+      {
+        "codec": "brotli-11",
+        "bytes": 25742001,
+        "enc_s": 173.98445010185242,
+        "dec_s": 0.3275740146636963,
+        "verified": true
+      },
+      {
+        "codec": "zpaq-m5",
+        "bytes": 19625074,
+        "enc_s": 6759.0647847652435,
+        "dec_s": null,
+        "verified": null
+      },
+      {
+        "codec": "augur",
+        "bytes": 20384422,
+        "enc_s": 221.1,
+        "dec_s": 247.5,
+        "verified": true,
+        "wall_s": 35909.996305942535
+      }
+    ]
+  }
+}

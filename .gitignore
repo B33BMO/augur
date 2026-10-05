@@ -1,3 +1,6 @@
 /target
 *.rec
 *.augur
+/bench/data
+/bench/work
+/bench/.venv
