@@ -21,7 +21,7 @@
 //! IEEE 754, so the same operation sequence gives the same bits on every
 //! conforming platform. Nothing here calls a transcendental function.
 
-use super::{stretch_tab, RATE_TAB};
+use super::{sm_init, sm_update, state_tab, stretch_tab, StateTab, RATE_TAB};
 
 
 // ---------------------------------------------------------------------------
@@ -430,13 +430,17 @@ impl Lms {
 /// prediction whose residual is coded.
 pub const NP: usize = 12; // audio
 /// Most predictors any model supplies (images).
-pub const NPMAX: usize = 24;
+pub const NPMAX: usize = 27;
 /// Direct maps per predictor: two residual resolutions, and one for the
 /// predictor corrected by its own last error.
 const MAPS_PER: usize = 4;
 /// Parametric inputs: Laplace distributions around chosen predictions.
 const NPAR: usize = 4;
-pub const FRONT_IN: usize = NPAR + NPMAX * MAPS_PER;
+/// Most value-domain hashed contexts a model supplies (images).
+pub const NVMAX: usize = 16;
+const VTAB_BITS: u32 = 23;
+const HMAP_BITS: u32 = 23;
+pub const FRONT_IN: usize = NPAR + NPMAX * MAPS_PER + 2 * NVMAX;
 
 const HIST: usize = 2048;
 const OLS_A_OWN: usize = 64;
@@ -661,7 +665,7 @@ impl AudioModel {
 
 const IMG_ROWS: usize = 8; // rows of history kept, ring-indexed
 /// Predictors the image model supplies.
-pub const NPI: usize = 24;
+pub const NPI: usize = 27;
 const IMG_X_N: usize = 15; // cross-component OLS inputs, at most
 
 /// Same-component taps (dy rows up, dx columns right) for the spatial OLS
@@ -701,11 +705,22 @@ pub struct ImageModel {
     // -> the last two values this component took there
     cache: Vec<[i32; 2]>,
     ckey: usize,
+    // cross-colour caches: the previous component's exact value with this
+    // component's colour difference at a neighbour -> what this one was
+    xcache: Vec<i32>,
+    xkey: [usize; NXC],
 }
+
+const NXC: usize = 3;
 
 
 
 const CACHE_BITS: u32 = 20;
+
+#[inline]
+fn lg2i(v: u64) -> u32 {
+    (64 - v.leading_zeros()).min(31)
+}
 
 #[inline]
 fn med(w: i32, n: i32, nw: i32) -> i32 {
@@ -748,6 +763,8 @@ impl ImageModel {
             ols_err: vec![4.0; comps],
             cache: vec![[i32::MIN; 2]; 1 << CACHE_BITS],
             ckey: 0,
+            xcache: vec![i32::MIN; 1 << CACHE_BITS],
+            xkey: [0; NXC],
 
         }
     }
@@ -885,6 +902,31 @@ impl ImageModel {
         let [c1, c2] = self.cache[self.ckey];
         // an empty entry has nothing to say; stand in plausible predictions
         let (c1, c2) = (if c1 == i32::MIN { m } else { c1 }, if c2 == i32::MIN { gap } else { c2 });
+        // cross-colour caches; the first component has no earlier one, so it
+        // keys on its own neighbours' differences instead
+        let xv = {
+            let (cb, dw, dn, c0) = if c > 0 {
+                let bw = self.get(0, -1, c - 1).unwrap_or(fb);
+                let bn = self.get(1, 0, c - 1).unwrap_or(fb);
+                (self.px[self.slot(0, x, c - 1)], w - bw, n - bn, if c > 1 { self.px[self.slot(0, x, 0)] } else { 0 })
+            } else {
+                (w, w - nw, n - nw, ne - n)
+            };
+            let keys = [(cb, dw, 0), (cb, dn, 0), (cb, dw, c0 ^ 0x5555)];
+            let mut out = [m; NXC];
+            for (j, &(a, b, e)) in keys.iter().enumerate() {
+                let mut hh = ((c as u64 + 1) << 40) ^ (j as u64) << 50;
+                for v in [a, b, e] {
+                    hh = (hh ^ v as u32 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                }
+                self.xkey[j] = (hh >> (64 - CACHE_BITS)) as usize;
+                let e = self.xcache[self.xkey[j]];
+                if e != i32::MIN {
+                    out[j] = e;
+                }
+            }
+            out
+        };
         let f = |v: i32| v as f64;
         let cand: [f64; NPI - 1] = [
             p_x,
@@ -910,6 +952,9 @@ impl ImageModel {
             f((6 * w - 4 * ww + www) + (6 * n - 4 * nn + nnn) - (6 * nw - 4 * nnww + nnnwww)) / 3.0,
             f(c1),
             f(c2),
+            f(xv[0]),
+            f(xv[1]),
+            f(xv[2]),
         ];
         // weight each candidate by its recent accuracy around this pixel
         let mut score = [1u64; NPI - 1];
@@ -959,6 +1004,66 @@ impl ImageModel {
         o.scale = [(ew[0].unsigned_abs() as f64 + en[0].unsigned_abs() as f64) * 0.5, self.ols_err[c]];
         let d = |j: usize| (self.p[j] - main).round() as i64;
         let cc = c.min(3) as u32;
+        {
+            let (cb, bw, bn) = if c > 0 {
+                (self.px[self.slot(0, x, c - 1)], self.get(0, -1, c - 1).unwrap_or(fb), self.get(1, 0, c - 1).unwrap_or(fb))
+            } else {
+                (prev1, prev1, prev1)
+            };
+            let c0v = if c > 1 { self.px[self.slot(0, x, 0)] } else { 0 };
+            let hv = |tag: u32, a: i32, b: i32, e: i32| -> u32 {
+                (tag << 28 | cc << 26)
+                    ^ (a as u32).wrapping_mul(0x9e37_79b1)
+                    ^ (b as u32).wrapping_mul(0x85eb_ca6b)
+                    ^ (e as u32).wrapping_mul(0xc2b2_ae35)
+            };
+            let r = |v: f64| v.round() as i32;
+            // the byte k before the same component of a neighbour, in file
+            // order: for the pixel above, "its p1"
+            let before = |dy: usize, dx: isize, k: usize| -> i32 {
+                // row-linear sample position, k samples back, in any layout
+                let lin = (x as isize + dx) * self.comps as isize + c as isize - k as isize;
+                if lin < 0 {
+                    return fb;
+                }
+                let (px_, cc2) = (lin as usize / self.comps, lin as usize % self.comps);
+                let rel = px_ as isize - x as isize;
+                self.get(dy, rel, cc2)
+                    .or_else(|| (dy == 0 && rel == 0 && cc2 < c).then(|| self.px[self.slot(0, x, cc2)]))
+                    .unwrap_or(fb)
+            };
+            let (p1, p2) = (prev1, prev2);
+            let (wp1, wp2) = (before(0, -1, 1), before(0, -1, 2));
+            let (np1, np2) = (before(1, 0, 1), before(1, 0, 2));
+            let plane = (w + n - nw) >> 1;
+            o.vctx = [
+                hv(1, w, n, 0),
+                hv(2, w, nw, 0),
+                hv(3, n, ne, 0),
+                hv(4, cb, w - bw, 0),
+                hv(5, cb, n - bn, 0),
+                hv(6, cb, c0v, 0),
+                hv(7, w + n - nw, 0, 0),
+                hv(8, m, gap, 0),
+                hv(9, cb + w - bw, cb + n - bn, 0),
+                hv(10, r(main), 0, 0),
+                hv(11, w >> 2, n >> 2, (nw >> 2) << 8 | (ne >> 2) & 255),
+                hv(12, r(main) >> 1, cb, 0),
+                // paq8px's strongest: the previous bytes against a neighbour's
+                hv(13, n, p1 - np1, p2 - np2),
+                hv(14, w, p1 - wp1, p2 - wp2),
+                hv(15, plane, p1, p2),
+                hv(16, p1, p2, 0),
+            ];
+            o.nv = NVMAX;
+            for j in 0..NPI {
+                let e = ew[j].unsigned_abs() as u64 + en[j].unsigned_abs() as u64;
+                o.pctx[j] = (lg2i(e).min(15) as u8) << 2 | cc as u8;
+            }
+            // which candidate has been most accurate around here
+            let best = (0..NPI - 1).min_by_key(|&j| score[j]).unwrap_or(0) as u32;
+            o.msel = [1 + (cc << 3), best << 2 | cc, o.errlog << 2 | cc, (lg2i(score[best as usize]) << 2) | cc];
+        }
         o.sctx = [
             cc << 4 | o.errlog,
             (self.bcx as u32) >> 2 | cc << 12,
@@ -997,6 +1102,9 @@ impl ImageModel {
         if e[0] != x as i32 {
             *e = [x as i32, e[0]];
         }
+        for j in 0..NXC {
+            self.xcache[self.xkey[j]] = x as i32;
+        }
         self.s += 1;
     }
 }
@@ -1030,6 +1138,12 @@ pub struct SampleFront {
     map_off: [usize; NPMAX * MAPS_PER],
     idx: [usize; NPMAX * MAPS_PER],
     pub out: Vec<i32>,
+    vtab: Vec<u32>,
+    vhist: Vec<u8>,
+    vsm: Vec<u32>,
+    stt: &'static StateTab,
+    vidx: [usize; NVMAX],
+    partial_bits: u32,
     v0: u32,
     pos: u32,
 }
@@ -1056,6 +1170,15 @@ struct Prep {
     errlog: u32,   // how surprising this neighbourhood has been, log scale
     scale: [f64; 2], // expected |main residual|: fast- and slow-tracking
     sctx: [u32; NSCTX], // model-specific byte contexts
+    // value-domain contexts, hashed per bit with the bits of the coded value
+    // known so far: only meaningful when the value itself is coded
+    vctx: [u32; NVMAX],
+    nv: usize,
+    // per predictor: a small context for its maps (its recent error, the
+    // component); when nonzero the maps are hashed with it
+    pctx: [u8; NPMAX],
+    // mixer selectors for models that want their own (0 = none)
+    msel: [u32; 4],
 }
 
 enum Model {
@@ -1100,7 +1223,7 @@ impl SampleFront {
         let mut f = Self {
             lay,
             model,
-            prep: Prep { p: [0.0; NPMAX], pe: [0.0; NPMAX], errlog: 0, scale: [1.0; 2], sctx: [0; NSCTX] },
+            prep: Prep { p: [0.0; NPMAX], pe: [0.0; NPMAX], errlog: 0, scale: [1.0; 2], sctx: [0; NSCTX], vctx: [0; NVMAX], nv: 0, msel: [0; 4], pctx: [0; NPMAX] },
             bits,
             cbits: 8 * cb as u32,
             cb,
@@ -1114,10 +1237,17 @@ impl SampleFront {
             np,
             d: [0; NPMAX],
             d1: [0; NPMAX],
-            maps: vec![(1 << 21) << 10; total],
+            // images hash their maps with a per-predictor context
+            maps: vec![(1 << 21) << 10; if lay.kind == KIND_IMAGE { 1 << HMAP_BITS } else { total }],
             map_off,
             idx: [0; NPMAX * MAPS_PER],
             out: Vec::new(),
+            vtab: if lay.kind == KIND_IMAGE { vec![(1 << 21) << 10; 1 << VTAB_BITS] } else { Vec::new() },
+            vhist: if lay.kind == KIND_IMAGE { vec![0; 1 << VTAB_BITS] } else { Vec::new() },
+            vsm: (0..NVMAX).flat_map(|_| sm_init(state_tab())).collect(),
+            stt: state_tab(),
+            vidx: [0; NVMAX],
+            partial_bits: 0,
             v0: 0,
             pos: 0,
         };
@@ -1141,6 +1271,13 @@ impl SampleFront {
             o.p[i] = o.p[i].clamp(-lim - 1.0, lim);
         }
         self.pred = o.p[0].round() as i64;
+        // Images are coded as values, not residuals: the predictors still
+        // steer every bit through their maps, and value-domain contexts —
+        // "the red here was 140" — keep their meaning, which a residual
+        // relative to a moving prediction blurs.
+        if matches!(self.model, Model::Image(_)) {
+            self.pred = 0;
+        }
         for i in 0..self.np {
             self.d[i] = o.p[i].round() as i64 - self.pred;
             self.d1[i] = o.pe[i].clamp(-lim - 1.0, lim).round() as i64 - self.pred;
@@ -1206,7 +1343,32 @@ impl SampleFront {
 
     /// Mixer inputs this front-end fills (the rest stay zero).
     pub fn live_inputs(&self) -> usize {
-        NPAR + self.np * MAPS_PER
+        // value contexts sit after the largest map block, so the count of
+        // maps in use doesn't move them
+        if self.vtab.is_empty() { NPAR + self.np * MAPS_PER } else { FRONT_IN }
+    }
+
+    /// Replacement selectors for mixers 0, 1, 3, 4 (images), with the bit
+    /// position folded into the first.
+    pub fn mixer_sels(&self, bitpos: u32) -> Option<[usize; 4]> {
+        let m = self.prep.msel;
+        // the bits of the value already coded matter as much as the context
+        let c0 = (self.partial_bits as usize | 1 << bitpos) & 0xff;
+        (m[0] != 0).then(|| [((m[0] as usize) >> 3) << 8 | c0, m[1] as usize, m[2] as usize, m[3] as usize])
+    }
+
+    /// SSE contexts for images: component with the partial value, the best
+    /// predictor's map position, and the main prediction's map position.
+    pub fn apm_ctxs(&self, bitpos: u32) -> Option<[usize; 3]> {
+        let m = self.prep.msel;
+        (m[0] != 0).then(|| {
+            let c0 = (self.partial_bits as usize | 1 << bitpos) & 0xff;
+            [
+                c0,
+                ((m[1] as usize) << 8 | c0) & 0xffff,
+                ((self.prep.errlog as usize) << 13 | (self.v0 as usize) << 5 | self.pos.min(31) as usize) & 0xffff,
+            ]
+        })
     }
 
     /// Mixer weight-set selector: loudness and bit position.
@@ -1223,6 +1385,7 @@ impl SampleFront {
         let pos = self.k as u32 * 8 + bitpos;
         self.pos = pos;
         let partial = (self.known << bitpos) | (c0 as u64 - (1u64 << bitpos));
+        self.partial_bits = (c0 - (1 << bitpos)) as u32;
         let lo = ((partial << (self.cbits - pos)) as i64) - (1i64 << (self.cbits - 1));
         for i in 0..self.np {
             for j in 0..MAPS_PER {
@@ -1234,7 +1397,12 @@ impl SampleFront {
                 if m == 2 {
                     self.v0 = v as u32; // main predictor, coarse: where the residual stands
                 }
-                let ix = self.map_off[m] + ((v << 5) as usize | pos as usize);
+                let ix = if self.vtab.is_empty() {
+                    self.map_off[m] + ((v << 5) as usize | pos as usize)
+                } else {
+                    let key = (m as u32) << 24 ^ (v as u32) << 5 ^ pos ^ (self.prep.pctx[i] as u32) << 18;
+                    (key.wrapping_mul(0x9e37_79b1) >> (32 - HMAP_BITS)) as usize
+                };
                 self.idx[m] = ix;
                 st[NPAR + m] = stab[(self.maps[ix] >> 20) as usize];
             }
@@ -1245,8 +1413,8 @@ impl SampleFront {
         let (lo_f, mid_f, hi_f) = (lo as f64, (lo + w / 2) as f64, (lo + w) as f64);
         let o = &self.prep;
         let par = [
-            (0.0, o.scale[0]),
-            (0.0, o.scale[1]),
+            (self.d[0] as f64, o.scale[0]),
+            (self.d[0] as f64, o.scale[1]),
             (self.d[1] as f64, o.scale[0]),
             (self.d1[0] as f64, o.scale[0]),
         ];
@@ -1256,6 +1424,19 @@ impl SampleFront {
             let p1 = laplace_upper(lo_f, mid_f, hi_f, mu, b);
             let p12 = ((p1 * 4096.0) as i32).clamp(1, 4095);
             st[j] = stab[p12 as usize];
+        }
+        // value-domain contexts: each with the coded bits so far
+        if !self.vtab.is_empty() {
+            let base = NPAR + NPMAX * MAPS_PER;
+            let kb = partial as u32 | 1 << pos;
+            for j in 0..o.nv {
+                let h = (o.vctx[j] ^ kb.wrapping_mul(0x9e37_79b1)).wrapping_add(j as u32).wrapping_mul(0x2545_f491);
+                let ix = (h >> (32 - VTAB_BITS)) as usize;
+                self.vidx[j] = ix;
+                st[base + 2 * j] = stab[(self.vtab[ix] >> 20) as usize];
+                let hs = self.vhist[ix] as usize;
+                st[base + 2 * j + 1] = stab[(self.vsm[(j << 8) | hs] >> 20) as usize];
+            }
         }
     }
 
@@ -1270,6 +1451,21 @@ impl SampleFront {
             let err = (((bit as i32) << 22) - p22) as i64;
             let p22 = (p22 + ((err * rate as i64) >> 16) as i32).clamp(0, (1 << 22) - 1) as u32;
             *v = (p22 << 10) | if n < lim { n + 1 } else { n };
+        }
+        if !self.vtab.is_empty() {
+            for j in 0..self.prep.nv {
+                let ix = self.vidx[j];
+                let v = &mut self.vtab[ix];
+                let n = *v & 1023;
+                let p22 = (*v >> 10) as i32;
+                let err = (((bit as i32) << 22) - p22) as i64;
+                let p22 = (p22 + ((err * RATE_TAB[n as usize] as i64) >> 16) as i32).clamp(0, (1 << 22) - 1) as u32;
+                *v = (p22 << 10) | if n < 255 { n + 1 } else { n };
+                let hs = self.vhist[ix] as usize;
+                let c = &mut self.vsm[(j << 8) | hs];
+                *c = sm_update(*c, bit);
+                self.vhist[ix] = self.stt.next[hs][bit as usize];
+            }
         }
     }
 }
@@ -1352,10 +1548,18 @@ impl Front {
             Front::Jpeg(f) => f.sse_ctx(),
         }
     }
+    /// Mixer selectors from a sample model (images), if it supplies them.
+    pub fn sample_sels(&self, bitpos: u32) -> Option<[usize; 4]> {
+        match self {
+            Front::Samples(f) => f.mixer_sels(bitpos),
+            Front::Jpeg(_) => None,
+        }
+    }
+
     /// Replacement contexts for the first three SSE stages, if this front-end has them.
     pub fn apm_ctxs(&self) -> Option<[usize; 3]> {
         match self {
-            Front::Samples(_) => None,
+            Front::Samples(f) => f.apm_ctxs(f.pos & 7),
             Front::Jpeg(f) => f.data_active().then(|| f.apm_ctxs()),
         }
     }

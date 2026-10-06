@@ -232,6 +232,7 @@ const MINLEN: usize = 6;
 const MINLEN_LONG: usize = 16;
 const CLIMIT: u16 = 8; // counter saturation: caps the slowest adaptation rate
 const LR: i32 = 15; // mixer learning rate (retuned for the two-layer mixer)
+const LR_SAMPLES: i32 = 8; // inside audio and image regions
 const APM_RATE: i32 = 8; // SSE adaptation shift
 const APM_EDGE: i32 = 1; // closest an SSE cell may get to certainty, in 1/65536
 const NMIX: usize = 5; // layer-1 mixers, one per selector view
@@ -243,7 +244,7 @@ const NMIX: usize = 5; // layer-1 mixers, one per selector view
 /// trust the match model is almost entirely a question of how long the match is.
 /// Mixer 4 is keyed on the effective order (how many byte orders have seen this
 /// context before), plus word and structure hits and the bit position.
-const MIX_CTX_BITS: [usize; NMIX] = [8, 8, 10, 8, 9];
+const MIX_CTX_BITS: [usize; NMIX] = [10, 8, 10, 8, 9];
 const ARRAY_TAG: u32 = 0xA22A_5151;
 const NUMSLOTS: usize = 1 << 16;
 const REC_MAXLEN: u32 = 8192; // longest value the record model will remember
@@ -930,9 +931,9 @@ impl<const N: usize> Mixer<N> {
 
     /// Gradient step on the weight set that produced `out`.
     #[inline]
-    fn update(&mut self, st: &[i32; N], out: i32, bit: u32, live: usize) {
+    fn update(&mut self, st: &[i32; N], out: i32, bit: u32, live: usize, lr: i32) {
         let sq = unsafe { *self.sqtab.get_unchecked((out.clamp(ST_MIN, ST_MAX) + 2048) as usize) };
-        let err = (((bit as i32) << 12) - sq) * LR;
+        let err = (((bit as i32) << 12) - sq) * lr;
         // SAFETY: sel was set by the matching mix() call; live <= N
         let w = unsafe { self.w.get_unchecked_mut(self.sel..self.sel + live) };
         for i in 0..live {
@@ -1138,6 +1139,8 @@ struct Predictor {
     done: Vec<Vec<i32>>,           // samples of the regions already coded, in order
     live: usize, // mixer inputs in use: the front-end's only exist when it does
     fast: bool,  // this bit is in a JPEG scan: the byte models are skipped
+    lr1: i32,    // mixer learning rates, layer 1 and 2
+    lr2: i32,
     ind1: Vec<u16>, // byte -> the last two bytes that followed it
     shape: u32,     // 2-bit class per recent byte: letter / digit / space / other
     fshape: u32,    // 3-bit finer class per recent byte (case, punctuation, control, high bit)
@@ -1257,6 +1260,8 @@ impl Predictor {
             done: Vec::new(),
             live: FRONT0,
             fast: false,
+            lr1: LR,
+            lr2: LR,
             ind1: vec![0; 256],
             shape: 0,
             fshape: 0,
@@ -1542,6 +1547,14 @@ impl Predictor {
         }
     }
 
+    /// Analysis aid: the JPEG bit kind of the next bit, or 16 outside a scan.
+    fn bit_kind(&self) -> usize {
+        match self.front.as_deref() {
+            Some(front::Front::Jpeg(f)) if f.data_active() => f.bit_kind(),
+            _ => 16,
+        }
+    }
+
     /// Inside a JPEG scan the byte models only add noise: skip their per-bit
     /// work entirely. Both sides decide this from the same state.
     #[inline]
@@ -1638,6 +1651,14 @@ impl Predictor {
     /// Front-end inputs, then the mixers and the SSE chain.
     #[inline]
     fn predict_mix(&mut self) -> u32 {
+        let in_samples = self.front.as_deref().is_some_and(|f| f.active() && f.sample_sels(0).is_some());
+        (self.lr1, self.lr2) = if in_samples {
+            // ~150 inputs of a different character: a gentler rate (swept: 8
+            // beat 4-24 fixed and every decay schedule tried)
+            (LR_SAMPLES, LR_SAMPLES)
+        } else {
+            (LR, LR)
+        };
         if let Some(f) = self.front.as_deref_mut() {
             if f.active() {
                 f.inputs(self.c0, self.bitpos, &mut self.st[FRONT0..]);
@@ -1652,7 +1673,7 @@ impl Predictor {
         let mut sel = self.mixer_selectors(last);
         if let Some(f) = self.front.as_deref().filter(|f| f.active()) {
             sel[2] = f.mixer_sel(self.bitpos);
-            if let Some([a, b, c, d]) = f.mixer_sels() {
+            if let Some([a, b, c, d]) = f.mixer_sels().or_else(|| f.sample_sels(self.bitpos)) {
                 sel[0] = a;
                 sel[1] = b;
                 sel[3] = c;
@@ -1749,10 +1770,10 @@ impl Predictor {
         if let Some(f) = self.front.as_deref_mut().filter(|f| f.active()) {
             f.update(bit);
         }
-        self.mix2.update(&self.m1out, self.mix2out, bit, NMIX);
+        self.mix2.update(&self.m1out, self.mix2out, bit, NMIX, self.lr2);
         for j in 0..NMIX {
             let out = self.m1out[j];
-            self.mix1[j].update(&self.st, out, bit, self.live);
+            self.mix1[j].update(&self.st, out, bit, self.live, self.lr1);
         }
         // context updates: the node's counter, its bit history, and the StateMap
         // cell that history was read through
@@ -3144,6 +3165,11 @@ trait BitSink {
     fn bit(&mut self, bit: u32, p: u32);
     /// Called after each byte, for sinks that account per byte.
     fn byte_done(&mut self) {}
+    /// Analysis sinks want to know what kind of bit is coming.
+    fn wants_kind(&self) -> bool {
+        false
+    }
+    fn kind(&mut self, _k: usize) {}
 }
 
 impl BitSink for Encoder {
@@ -3157,12 +3183,23 @@ impl BitSink for Encoder {
 struct CostSink {
     cur: f64,
     out: Vec<f32>,
+    by_kind: [(f64, u64); 17], // JPEG bit kinds 0..15, 16 = everything else
+    kind: usize,
 }
 
 impl BitSink for CostSink {
     fn bit(&mut self, bit: u32, p: u32) {
         let p = p as f64 / 65536.0;
-        self.cur -= (if bit == 1 { p } else { 1.0 - p }).log2();
+        let c = -(if bit == 1 { p } else { 1.0 - p }).log2();
+        self.cur += c;
+        self.by_kind[self.kind].0 += c;
+        self.by_kind[self.kind].1 += 1;
+    }
+    fn wants_kind(&self) -> bool {
+        true
+    }
+    fn kind(&mut self, k: usize) {
+        self.kind = k;
     }
     fn byte_done(&mut self) {
         self.out.push(self.cur as f32);
@@ -3174,6 +3211,9 @@ impl BitSink for CostSink {
 fn code_byte(pr: &mut Predictor, enc: &mut impl BitSink, byte: u8) {
     for i in (0..8).rev() {
         let bit = ((byte >> i) & 1) as u32;
+        if enc.wants_kind() {
+            enc.kind(pr.bit_kind());
+        }
         let p = pr.predict();
         enc.bit(bit, p);
         pr.update(bit);
@@ -3443,10 +3483,17 @@ fn main() {
             let recipe = recomp::recipe_bytes(&ex.pieces, &ex.layouts);
             let mut prefix = (recipe.len() as u32).to_le_bytes().to_vec();
             prefix.extend_from_slice(&recipe);
-            let mut sink = CostSink { cur: 0.0, out: Vec::new() };
+            let mut sink = CostSink { cur: 0.0, out: Vec::new(), by_kind: [(0.0, 0); 17], kind: 16 };
             encode_into(&mut sink, &prefix, &ex.virt, sniff(&ex.virt), mem_bits_for(ex.virt.len()), None, &ex.layouts);
             let total: f64 = sink.out.iter().map(|&c| c as f64).sum();
             eprintln!("{} coded bytes ({} prefix), {:.0} bytes of cost", sink.out.len(), prefix.len(), total / 8.0);
+            let names = ["code", "sign", "magnitude", "other"];
+            for (k, &(c, n)) in sink.by_kind.iter().enumerate() {
+                if n > 0 && k < 16 {
+                    let what = format!("{} {} {}", if k & 8 != 0 { "chroma" } else { "luma" }, if k & 4 != 0 { "DC" } else { "AC" }, names[k & 3]);
+                    eprintln!("  {what:22} {n:>9} bits -> {:>9.0} bytes ({:.3} bits/bit)", c / 8.0, c / n as f64);
+                }
+            }
             let out: Vec<u8> = sink.out.iter().flat_map(|c| c.to_le_bytes()).collect();
             write_or_die(&format!("{}.costs", args[2]), &out);
         }

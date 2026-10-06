@@ -14,14 +14,21 @@
 //! Anything the parser does not understand turns the model off for the rest of
 //! the scan; the bytes still flow through the ordinary models.
 
-use super::{sm_init, sm_update, state_tab, stretch_tab, StateTab, RATE_TAB};
+use super::{sm_init, sm_update, state_tab, stretch_tab, Mixer, StateTab, RATE_TAB};
 
 /// Hashed contexts per bit.
-const NCTX: usize = 24;
+const NCTX: usize = 32;
 /// Mixer inputs: a direct counter and a bit history per context, plus the
 /// special-bit oracle.
-pub const JPEG_IN: usize = 2 * NCTX + 1;
-const TABLE_BITS: u32 = 22;
+pub const JPEG_IN: usize = 2 * NCTX + 1 + NJM;
+/// Inner mixers: the JPEG inputs blended under JPEG-specific weight sets,
+/// their outputs handed on as inputs of their own (paq8px's inner mixer).
+const NJM: usize = 6;
+const JM_IN: usize = 2 * NCTX + 1;
+const JM_BITS: [usize; NJM] = [8, 8, 8, 9, 9, 8];
+/// Gentler than the main mixers: many correlated inputs.
+const JM_LR: i32 = 8;
+const TABLE_BITS: u32 = 24;
 
 const ZZU: [u8; 64] = [
     0, 1, 0, 0, 1, 2, 3, 2, 1, 0, 0, 1, 2, 3, 4, 5, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4, 5, 6, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4,
@@ -342,6 +349,11 @@ pub struct JpegFront {
     prev_blk: [i32; 64], // the block decoded before this one, and the one before
     prev_blk2: [i32; 64],
     sum_abs: i32,      // sum of |coefficient| so far in this block
+    last_rs: u32,      // the previous Huffman symbol of this block
+    jm: Vec<Mixer<JM_IN>>,
+    jm_in: [i32; JM_IN],
+    jm_out: [i32; NJM],
+    jm_on: bool,
 }
 
 impl JpegFront {
@@ -398,6 +410,11 @@ impl JpegFront {
             prev_blk: [0; 64],
             prev_blk2: [0; 64],
             sum_abs: 0,
+            last_rs: 0,
+            jm: JM_BITS.iter().map(|&b| Mixer::new(b)).collect(),
+            jm_in: [0; JM_IN],
+            jm_out: [0; NJM],
+            jm_on: false,
         };
         f.start_block();
         f.active = f.start < f.end;
@@ -479,6 +496,19 @@ impl JpegFront {
         }
     }
 
+    /// Analysis aid: what kind of bit comes next — 0 Huffman code, 1 sign,
+    /// 2 magnitude, 3 other; plus 4 for DC, 8 for chroma.
+    pub fn bit_kind(&self) -> usize {
+        let k = match self.phase {
+            Phase::Code => 0,
+            Phase::Extra(_) if self.elen == 0 => 1,
+            Phase::Extra(_) => 2,
+            _ => 3,
+        };
+        let chroma = self.scan.as_ref().is_some_and(|s| s.scomp[s.mcu_blocks[self.blk].0] != 0);
+        k | (self.is_dc as usize) << 2 | (chroma as usize) << 3
+    }
+
     /// Is the decoder following the scan (rather than finished or lost)?
     pub fn data_active(&self) -> bool {
         self.active && matches!(self.phase, Phase::Code | Phase::Extra(_))
@@ -515,6 +545,7 @@ impl JpegFront {
             }
         }
         self.sum_abs = 0;
+        self.last_rs = 0;
         self.block_ctx();
     }
 
@@ -562,6 +593,39 @@ impl JpegFront {
             self.adv[2] = 0;
         }
         self.pred_cat = ((self.adv[1].unsigned_abs() + 15) >> 4).min(15);
+        // two-sided extrapolation: both edges at once, with the higher
+        // frequencies' contributions taken out (paq8px's extrapolateDct)
+        let adv3 = {
+            let tail_u: i64 = self.sum_u[u as usize + 1..].iter().sum();
+            let tail_v: i64 = self.sum_v[v as usize + 1..].iter().sum();
+            let from_n = self.sum_u[u as usize] * (2 + u as i64) - 2 * tail_u;
+            let from_w = self.sum_v[v as usize] * (2 + v as i64) - 2 * tail_v;
+            let ex = match (above.is_some(), left.is_some()) {
+                (true, true) => from_n + from_w,
+                (true, false) => 2 * from_n,
+                (false, true) => 2 * from_w,
+                _ => 0,
+            };
+            let ex = ex * 4 / (u as i64 + v as i64 + 16) / (qt[k] as i64 * 185).max(1);
+            slog(ex - dc_prev)
+        };
+        // where along the zigzag the next clearly larger coefficient is expected
+        let mut run_pred = [0i32; 3];
+        for (i, rp) in run_pred.iter_mut().enumerate() {
+            for st in 1..10 {
+                let k2 = k + st;
+                if k2 >= 64 {
+                    break;
+                }
+                let (u2, v2) = (ZZU[k2], ZZV[k2]);
+                let den2 = (qt[k2] as i64 * 185 * (16 + v2 as i64) * (16 + u2 as i64) / 128).max(1);
+                let p = slog((self.sum_u[u2 as usize] * i as i64 + self.sum_v[v2 as usize] * (2 - i as i64)) / den2);
+                if p.abs() > self.adv[i].abs() + 2 && self.adv[i].abs() < 210 {
+                    *rp = st as i32 * 2 + (p > 0) as i32;
+                    break;
+                }
+            }
+        }
         // in-block neighbours, rescaled to this coefficient's quantiser
         let lcp = |du: u8, dv: u8| -> i32 {
             if u < du || v < dv {
@@ -614,6 +678,23 @@ impl JpegFront {
             h(22, lg(if k > 0 { self.cur[k - 1] } else { 0 }) as i32, 0, 0),
             h(23, ad[1] / 24, self.sum_abs.min(255) >> 4, 0),
             h(24, l0 / 16, l1 / 16, ad[1] / 24),
+            h(25, adv3 / 11, l0.max(l1) / 50, 0),
+            h(26, adv3 / 13, prev / 11, low),
+            h(27, run_pred[0], prev / 11, low),
+            h(28, ad[2] / 12, run_pred[2], prev / 12),
+            h(29, self.last_rs as i32, self.nz.min(15) as i32, 0),
+            h(30, l0 / 14, l1 / 14, adv3 / 16),
+            // signs: every edge prediction's direction, and how sure the
+            // strongest is
+            {
+                let sg = |v: i32| (v.signum() + 1) as i32;
+                let pat = ((sg(ad[0]) * 3 + sg(ad[1])) * 3 + sg(ad[2])) * 3 + sg(adv3);
+                h(31, pat, ad[1].abs().max(adv3.abs()) / 16, 0)
+            },
+            {
+                let sg = |v: i32| (v.signum() + 1) as i32;
+                h(32, sg(l0) * 9 + sg(l1) * 3 + sg(prev), sg(ad[1]) * 3 + sg(adv3), (zu + zv).min(7))
+            },
         ];
         self.sel = ((k.min(15) as usize) << 1) | self.is_dc as usize;
     }
@@ -661,6 +742,8 @@ impl JpegFront {
                 None
             };
             st[..2 * NCTX].fill(0);
+            st[2 * NCTX + 1..JPEG_IN].fill(0);
+            self.jm_on = false;
             match exp {
                 Some(e) => {
                     self.sexp = Some(e);
@@ -691,6 +774,17 @@ impl JpegFront {
             let h = self.hist[ix] as usize;
             st[NCTX + i] = stab[(self.sm[(i << 8) | h] >> 20) as usize];
         }
+        // inner mixers over the same inputs, a bias in the oracle's place
+        self.jm_in.copy_from_slice(&st[..JM_IN]);
+        self.jm_in[2 * NCTX] = 256;
+        let [a, b, c, d] = self.mixer_sels();
+        let adv_b = ((self.adv[1] / 16).clamp(-31, 32) + 31) as usize;
+        let sels = [a, b, c, d, self.last_rs as usize, adv_b << 2 | matches!(self.phase, Phase::Extra(_)) as usize];
+        for j in 0..NJM {
+            self.jm_out[j] = self.jm[j].mix(&self.jm_in, sels[j], JM_IN);
+        }
+        st[2 * NCTX + 1..JPEG_IN].copy_from_slice(&self.jm_out);
+        self.jm_on = true;
     }
 
     #[inline]
@@ -711,6 +805,12 @@ impl JpegFront {
                 self.phase = Phase::Done; // not the marker we expected
             }
         } else if self.data_bit() {
+            if self.jm_on {
+                for j in 0..NJM {
+                    let out = self.jm_out[j];
+                    self.jm[j].update(&self.jm_in, out, bit, JM_IN, JM_LR);
+                }
+            }
             for i in 0..NCTX {
                 let ix = self.idx[i];
                 Self::train(&mut self.table[ix], bit, 255);
@@ -754,6 +854,7 @@ impl JpegFront {
                         }
                     } else {
                         let (r, sz) = ((sym >> 4) as usize, (sym & 15) as usize);
+                        self.last_rs = sym as u32 + 1;
                         if sz == 0 {
                             if r == 15 {
                                 // sixteen zeros
@@ -939,4 +1040,3 @@ pub fn follows_scan(file: &[u8], scan_off: usize, len: usize) -> bool {
     let s = f.scan.as_ref().unwrap();
     f.mcu >= s.mcux * s.mcuy && f.phase != Phase::Code
 }
-

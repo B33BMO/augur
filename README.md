@@ -17,8 +17,8 @@ It has **zero dependencies** (not even for the CLI).
 Where it stands, plainly:
 
 - **Against `zpaq -m5`**, the strongest widely-packaged context mixer, it takes the Silesia corpus by **9.6%** and wins 11 of its 12 files; on deflate-packed files (PDFs, JARs, archives) it is **26–66%** smaller, because zpaq cannot see inside them.
-- **Against format specialists** it wins too: **8–31% smaller than `flac -8`** on audio, **~10% smaller than JPEG XL** (`cjxl -d 0 -e 9`) on photographic images, and **19%** off baseline JPEGs.
-- **Against paq8px**, the research-grade champion, it is mostly behind: within ~0.5% on most 16-bit audio (and far ahead on 24-bit, which paq8px does not model), but ~4 points behind on JPEG and well behind on colour photographs.
+- **Against format specialists** it wins too: **8–31% smaller than `flac -8`** on audio, **~21% smaller than JPEG XL** (`cjxl -d 0 -e 9`) on photographic images, and **20%** off baseline JPEGs.
+- **Against paq8px**, the research-grade champion, it is mostly behind: within ~0.5% on most 16-bit audio (and far ahead on 24-bit, which paq8px does not model), ~3.5 points behind on JPEG, ~15% on colour photographs, and 10–38% on prose, source code and executables.
 - It is **slow** — tens of KB/s on audio, images and JPEG. See the caveats.
 
 ## Results
@@ -86,17 +86,17 @@ Kodak test images as PPM/PGM/BMP (same pixels for every codec):
 
 | | WebP lossless -z 9 | JPEG XL -e 9 | **augur** | paq8px -8 |
 |---|---|---|---|---|
-| 12 images, total | 5,152,832 | 4,684,382 | **4,223,771** | 3,171,165 |
+| 12 images, total | 5,152,832 | 4,684,382 | **3,715,154** | 3,171,165 |
 
-All 24 Kodak **PNGs** as distributed (15.4 MB): **augur 9,095,522 (−40.9%)**, JPEG XL 10,156,780, WebP 11,252,092. Half of these PNGs were not written by zlib; reflate costs them under 1%.
+All 24 Kodak **PNGs** as distributed (15.4 MB): **augur 9,095,522 (−40.9%)** with the previous image model (the current one is ~12% smaller on the same pixels; not yet re-measured on the PNGs), JPEG XL 10,156,780, WebP 11,252,092. Half of these PNGs were not written by zlib; reflate costs them under 1%.
 
-paq8px's lead on colour photographs comes from its much larger cross-colour model; on greyscale the gap is 5–11%.
+augur is 20.7% smaller than JPEG XL here; paq8px is still 15% smaller than augur on colour and 3–7% on greyscale.
 
 ### JPEG
 
 | | original | **augur** | paq8px -8 |
 |---|---|---|---|
-| 8 Kodak JPEGs (cjpeg: plain, optimised, restart markers, greyscale) | 951,266 | **767,310 (−19.3%)** | 729,007 (−23.4%) |
+| 8 Kodak JPEGs (cjpeg: plain, optimised, restart markers, greyscale) | 951,266 | **761,518 (−19.9%)** | 729,007 (−23.4%) |
 | Nikon D80 photo, 46 MP | 14,679,474 | **10,220,623 (−30.4%)** | — |
 
 ### Structured data (earlier release)
@@ -173,7 +173,7 @@ The coded stream begins with the recipe (expansion tree and sample layouts), so 
 
 - **It is slow.** Generic data runs around 0.25 MB/s each way; audio, images and JPEG run at tens of KB/s, because every sample drives least-squares solves or every bit drives two dozen hashed lookups. Encode and decode cost about the same. This is a write-once, read-rarely compressor: archival, backups, cold storage.
 - **Memory is up to ~1 GB** for large inputs.
-- **paq8px is stronger** on colour photographs (by ~25%), JPEG (by ~4 points of saving), and some audio. augur is ahead of every *practical* codec measured, not of every research one.
+- **paq8px is stronger** on prose, source code and executables (10–38% on Silesia's text and binary files), colour photographs (~15%), JPEG (~3.5 points of saving), and some audio. augur is ahead of every *practical* codec measured, not of every research one.
 - **Not yet handled:** progressive JPEG (coded as ordinary bytes), MP3/AAC, FLAC, GIF/LZW, xz/bzip2/zstd payloads. These pass through the generic models and gain little.
 - **Containers from v0.1 and earlier versions cannot be decoded** by this release; the format changed twice (versions 4 and 5).
 
