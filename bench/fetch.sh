@@ -17,3 +17,10 @@ if [ ! -f enwik8 ]; then
   unzip -qo enwik8.zip && rm -f enwik8.zip
 fi
 echo "  enwik8 ($(wc -c <enwik8) bytes)"
+
+# Silesia: the standard mixed corpus, 12 files, unpacked into data/silesia/.
+if [ ! -d silesia ]; then
+  curl -sSL --fail -o silesia.zip "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip"
+  mkdir -p silesia && unzip -qo silesia.zip -d silesia && rm -f silesia.zip
+fi
+echo "  silesia/ ($(ls silesia | wc -l) files)"

@@ -45,6 +45,13 @@ use std::fs;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+mod deflate;
+mod front;
+mod jpeg;
+mod recomp;
+mod reflate;
+use front::{Front, Layout, FRONT_IN};
+
 // ---------------------------------------------------------------------------
 // Binary arithmetic coder (carryless, 32-bit). p is P(bit==1) in 16-bit units:
 // on highly redundant data a 12-bit probability caps every bit at a cost of at
@@ -219,7 +226,8 @@ const NMATCH: usize = 2; // match models: short-context (fast reacquire) + long 
 const NREC: usize = 1; // record-history model
 const NRUN: usize = 1; // run map: the highest order whose context keeps repeating one byte
 const ORA0: usize = 3 * NTAB; // first oracle input: each context feeds a counter and a bit history
-const NIN: usize = ORA0 + NMATCH + NREC + NRUN + 1; // contexts + match + record + run + numeric
+const FRONT0: usize = ORA0 + NMATCH + NREC + NRUN + 1; // first sample front-end input
+const NIN: usize = FRONT0 + FRONT_IN; // contexts + match + record + run + numeric + front-end
 const MINLEN: usize = 6;
 const MINLEN_LONG: usize = 16;
 const CLIMIT: u16 = 8; // counter saturation: caps the slowest adaptation rate
@@ -906,14 +914,15 @@ impl<const N: usize> Mixer<N> {
         Self { w: vec![(1i32 << 16) / N as i32; nsets * N], mask: nsets - 1, sel: 0, sqtab: squash_tab() }
     }
 
-    /// Blend `st` under weight set `ctx`; returns the stretched prediction.
+    /// Blend the first `live` inputs of `st` under weight set `ctx`; returns
+    /// the stretched prediction. Inputs past `live` are known to be zero.
     #[inline]
-    fn mix(&mut self, st: &[i32; N], ctx: usize) -> i32 {
+    fn mix(&mut self, st: &[i32; N], ctx: usize, live: usize) -> i32 {
         self.sel = (ctx & self.mask) * N;
-        // SAFETY: sel + N <= (mask+1)*N = w.len()
-        let w = unsafe { self.w.get_unchecked(self.sel..self.sel + N) };
+        // SAFETY: sel + N <= (mask+1)*N = w.len(), and live <= N
+        let w = unsafe { self.w.get_unchecked(self.sel..self.sel + live) };
         let mut dot: i64 = 0;
-        for i in 0..N {
+        for i in 0..live {
             dot += w[i] as i64 * st[i] as i64;
         }
         ((dot >> 16) as i32).clamp(ST_MIN, ST_MAX)
@@ -921,12 +930,12 @@ impl<const N: usize> Mixer<N> {
 
     /// Gradient step on the weight set that produced `out`.
     #[inline]
-    fn update(&mut self, st: &[i32; N], out: i32, bit: u32) {
+    fn update(&mut self, st: &[i32; N], out: i32, bit: u32, live: usize) {
         let sq = unsafe { *self.sqtab.get_unchecked((out.clamp(ST_MIN, ST_MAX) + 2048) as usize) };
         let err = (((bit as i32) << 12) - sq) * LR;
-        // SAFETY: sel was set by the matching mix() call
-        let w = unsafe { self.w.get_unchecked_mut(self.sel..self.sel + N) };
-        for i in 0..N {
+        // SAFETY: sel was set by the matching mix() call; live <= N
+        let w = unsafe { self.w.get_unchecked_mut(self.sel..self.sel + live) };
+        for i in 0..live {
             w[i] += (st[i] * err) >> 16;
         }
     }
@@ -949,7 +958,7 @@ impl<const N: usize> Mixer<N> {
 // under 256, so a state fits in a byte.
 // ---------------------------------------------------------------------------
 
-struct StateTab {
+pub(crate) struct StateTab {
     next: [[u8; 2]; 256],
     n0: [u8; 256],
     n1: [u8; 256],
@@ -989,7 +998,7 @@ fn hist_next(s: (u32, u32, u32), y: u32) -> (u32, u32, u32) {
     (n0, n1, last)
 }
 
-fn state_tab() -> &'static StateTab {
+pub(crate) fn state_tab() -> &'static StateTab {
     static T: OnceLock<StateTab> = OnceLock::new();
     T.get_or_init(|| {
         let mut ids: Vec<(u32, u32, u32)> = vec![(0, 0, 0)];
@@ -1023,7 +1032,7 @@ fn state_tab() -> &'static StateTab {
 /// given history predicts is a property of the file, so it should settle.
 const SM_LIMIT: u32 = 1023;
 
-fn sm_init(st: &StateTab) -> Vec<u32> {
+pub(crate) fn sm_init(st: &StateTab) -> Vec<u32> {
     (0..256)
         .map(|s| {
             let (n0, n1) = (st.n0[s] as u64, st.n1[s] as u64);
@@ -1034,7 +1043,7 @@ fn sm_init(st: &StateTab) -> Vec<u32> {
 }
 
 #[inline]
-fn sm_update(v: u32, bit: u32) -> u32 {
+pub(crate) fn sm_update(v: u32, bit: u32) -> u32 {
     let n = v & 1023;
     let p22 = (v >> 10) as i32;
     let rate = unsafe { *RATE_TAB.get_unchecked(n as usize) };
@@ -1124,6 +1133,11 @@ struct Predictor {
     word_hash: u32,
     line_start: usize, // buffer offset of the current line's first byte
     img: Option<ImgGeom>, // set when coding the residuals of a raw 16-bit image
+    front: Option<Box<Front>>, // numeric sample model running in lockstep (audio, images)
+    pending: Vec<(usize, Layout)>, // regions still ahead, by coded start, last first
+    done: Vec<Vec<i32>>,           // samples of the regions already coded, in order
+    live: usize, // mixer inputs in use: the front-end's only exist when it does
+    fast: bool,  // this bit is in a JPEG scan: the byte models are skipped
     ind1: Vec<u16>, // byte -> the last two bytes that followed it
     shape: u32,     // 2-bit class per recent byte: letter / digit / space / other
     fshape: u32,    // 3-bit finer class per recent byte (case, punctuation, control, high bit)
@@ -1238,6 +1252,11 @@ impl Predictor {
             word_hash: 0,
             line_start: 0,
             img: None,
+            front: None,
+            pending: Vec::new(),
+            done: Vec::new(),
+            live: FRONT0,
+            fast: false,
             ind1: vec![0; 256],
             shape: 0,
             fshape: 0,
@@ -1324,6 +1343,43 @@ impl Predictor {
         self.img = img;
         self.recompute_ctx();
         self.select_slots();
+    }
+
+    /// Schedule sample regions, each (coded start, layout), in order. Must be
+    /// called at a byte boundary at or before the first region's start.
+    fn set_fronts(&mut self, mut regions: Vec<(usize, Layout)>) {
+        regions.reverse();
+        self.pending = regions;
+        if self.attach_due() {
+            // the next nibble's slots were claimed under the old contexts
+            for m in 0..NTAB {
+                self.slots[self.cur[m]] = SLOT_EMPTY;
+            }
+            self.recompute_ctx();
+            self.select_slots();
+        }
+    }
+
+    /// At a byte boundary: retire a finished region, start a due one. Returns
+    /// whether a front-end was attached.
+    fn attach_due(&mut self) -> bool {
+        let pos = self.buf.len();
+        if let Some(f) = self.front.as_deref_mut() {
+            f.locate(pos, &self.buf);
+            if f.finished(pos) {
+                let f = self.front.take().unwrap();
+                self.done.push(f.into_samples());
+                self.live = FRONT0;
+            }
+        }
+        if self.front.is_none() && self.pending.last().is_some_and(|r| r.0 == pos) {
+            let (start, lay) = self.pending.pop().unwrap();
+            let f = Front::new(lay, start, &self.buf);
+            self.live = FRONT0 + f.live_inputs();
+            self.front = Some(Box::new(f));
+            return true;
+        }
+        false
     }
 
     /// Image residual contexts. A residual's size is best predicted by its
@@ -1475,10 +1531,37 @@ impl Predictor {
         if let Some(g) = self.img {
             self.image_ctx(g);
         }
+        if let Some(f) = self.front.as_deref().filter(|f| f.active()) {
+            let mut c = [0u32; 8];
+            if f.slot_ctx(&mut c) {
+                let slots = [WORD0, WORD0 + 1, WORD0 + 2, WORD0 + 3, SHAPE0, SHAPE0 + 1, SHAPE0 + 2];
+                for (j, &m) in slots.iter().enumerate() {
+                    self.ctxh[m] = c[j];
+                }
+            }
+        }
+    }
+
+    /// Inside a JPEG scan the byte models only add noise: skip their per-bit
+    /// work entirely. Both sides decide this from the same state.
+    #[inline]
+    fn passthrough_fast(&self) -> bool {
+        self.front.as_deref().is_some_and(|f| f.mixer_sels().is_some())
     }
 
     #[inline]
     fn predict(&mut self) -> u32 {
+        self.fast = self.passthrough_fast();
+        if self.fast {
+            self.st[..FRONT0].fill(0);
+            for tm in &mut self.trust_match {
+                tm.idle();
+            }
+            self.trust_rec.idle();
+            self.trust_num.idle();
+            self.trust_run.idle();
+            return self.predict_mix();
+        }
         let stab = stretch_tab();
         let node = self.node;
         for m in 0..NTAB {
@@ -1549,14 +1632,37 @@ impl Predictor {
             }
         };
 
+        self.predict_mix()
+    }
+
+    /// Front-end inputs, then the mixers and the SSE chain.
+    #[inline]
+    fn predict_mix(&mut self) -> u32 {
+        if let Some(f) = self.front.as_deref_mut() {
+            if f.active() {
+                f.inputs(self.c0, self.bitpos, &mut self.st[FRONT0..]);
+            } else {
+                self.st[FRONT0..].fill(0);
+            }
+        }
+
         // --- two-layer mixing ---
         let last = *self.buf.last().unwrap_or(&0) as u32;
         let prev2 = if self.buf.len() >= 2 { self.buf[self.buf.len() - 2] as u32 } else { 0 };
-        let sel = self.mixer_selectors(last);
-        for j in 0..NMIX {
-            self.m1out[j] = self.mix1[j].mix(&self.st, sel[j]);
+        let mut sel = self.mixer_selectors(last);
+        if let Some(f) = self.front.as_deref().filter(|f| f.active()) {
+            sel[2] = f.mixer_sel(self.bitpos);
+            if let Some([a, b, c, d]) = f.mixer_sels() {
+                sel[0] = a;
+                sel[1] = b;
+                sel[3] = c;
+                sel[4] = d;
+            }
         }
-        self.mix2out = self.mix2.mix(&self.m1out, self.c0 as usize);
+        for j in 0..NMIX {
+            self.m1out[j] = self.mix1[j].mix(&self.st, sel[j], self.live);
+        }
+        self.mix2out = self.mix2.mix(&self.m1out, self.c0 as usize, NMIX);
 
         // SSE chain: three calibrations of the mixed output, each blended 3:1
         // with its input so a cold APM can only nudge, never hijack.
@@ -1574,10 +1680,20 @@ impl Predictor {
             | ((self.bitpos as usize) << 4)
             | (self.c0 as usize & 15);
 
+        // a JPEG scan calibrates on its own state; byte contexts mean nothing there
+        let (c0cx, o1cx, strcx) = match self.front.as_deref().and_then(|f| f.apm_ctxs()) {
+            Some([a, b, c]) => (a, b << 8, c << 8),
+            None => (self.c0 as usize, o1cx, strcx),
+        };
         let p = squash(self.mix2out).clamp(1, 4095) << 4;
-        let p = (self.apm_c0.refine(p, self.c0 as usize) * 3 + p) >> 2;
+        let p = (self.apm_c0.refine(p, c0cx) * 3 + p) >> 2;
         let p = (self.apm_o1.refine(p, o1cx >> 8) * 3 + p) >> 2;
         let p = (self.apm_str.refine(p, strcx >> 8) * 3 + p) >> 2;
+        // in a sample region the oracles are idle; calibrate on the sample state instead
+        let oracx = match self.front.as_deref().filter(|f| f.active()) {
+            Some(f) => f.sse_ctx(),
+            None => oracx,
+        };
         let p = (self.apm_ora.refine(p, oracx) * 3 + p) >> 2;
         self.p_raw = p;
         let floor = if self.floor_tally < 0 { FLOOR_LO } else { FLOOR_HI };
@@ -1630,15 +1746,18 @@ impl Predictor {
         self.trust_rec.update(bit);
         self.trust_num.update(bit);
         self.trust_run.update(bit);
-        self.mix2.update(&self.m1out, self.mix2out, bit);
+        if let Some(f) = self.front.as_deref_mut().filter(|f| f.active()) {
+            f.update(bit);
+        }
+        self.mix2.update(&self.m1out, self.mix2out, bit, NMIX);
         for j in 0..NMIX {
             let out = self.m1out[j];
-            self.mix1[j].update(&self.st, out, bit);
+            self.mix1[j].update(&self.st, out, bit, self.live);
         }
         // context updates: the node's counter, its bit history, and the StateMap
         // cell that history was read through
         let node = self.node;
-        for m in 0..NTAB {
+        for m in 0..if self.fast { 0 } else { NTAB } {
             let sl = unsafe { self.slots.get_unchecked_mut(self.cur[m]) };
             let c = unsafe { sl.ctr.get_unchecked_mut(node) };
             *c = ctr_update(*c, bit, CLIMIT);
@@ -1656,7 +1775,9 @@ impl Predictor {
             self.bitpos = 0;
         }
         if self.bitpos == 0 || self.bitpos == 4 {
-            self.select_slots();
+            if !self.passthrough_fast() {
+                self.select_slots();
+            }
         } else {
             // node index within the nibble tree: 1 + 2 + 4 + 8 nodes, heap-ordered
             let k = self.bitpos & 3;
@@ -1826,6 +1947,7 @@ impl Predictor {
             Mode::Generic => self.update_struct_generic(byte),
         }
 
+        self.attach_due();
         self.recompute_ctx();
     }
 
@@ -2523,271 +2645,191 @@ impl Predictor {
 }
 
 // ---------------------------------------------------------------------------
-// Lossless audio front-end.
-//
-// PCM audio defeats every model in the portfolio. A waveform is not a sequence
-// of repeated byte strings — sample 44100 has almost nothing byte-wise in common
-// with sample 44099, even though it is nearly *numerically* equal to it. Context
-// models see noise, the match models never fire, and augur lands well behind
-// FLAC, which is not even a context mixer: it just predicts each sample from its
-// neighbours and codes the difference.
-//
-// So do that, and hand the difference to the mixer. Three stages, each exactly
-// invertible:
-//
-//   1. Mid/side. Stereo channels are highly correlated; coding (L-R) instead of
-//      R removes most of that. Using a shift rather than a divide keeps it exact.
-//   2. A cascade of sign-sign LMS filters. Rather than fitting coefficients per
-//      block and storing them like FLAC does, the filter *adapts* — and because
-//      the decoder runs the identical integer update on the samples it has
-//      already reconstructed, the two stay in lockstep with no side channel at
-//      all. This is the same predict-code-update symmetry as the rest of augur.
-//   3. Zigzag, then split into byte planes. Residuals are small and signed, so
-//      zigzag maps them near zero, and separating high bytes from low bytes puts
-//      all the near-constant bytes in one run instead of interleaving them with
-//      the noisy ones.
-//
-// What is left is a residual stream whose entropy is far below the waveform's,
-// and which the existing context models handle well.
+// WAV detection. The audio model itself lives in front.rs; all this does is
+// find the sample array and describe it.
 // ---------------------------------------------------------------------------
 
-/// One sign-sign LMS stage. Integer throughout: the update uses only the signs
-/// of the error and the history, so there is no multiply in the adaptation and
-/// no possibility of the encoder and decoder diverging on rounding.
-struct Lms {
-    w: Vec<i32>,
-    hist: Vec<i32>,
-    shift: u32,
-    mu: i32,
-}
+const WAVE_FORMAT_PCM: u16 = 1;
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xfffe;
 
-impl Lms {
-    fn new(order: usize, shift: u32, mu: i32) -> Self {
-        Self { w: vec![0; order], hist: vec![0; order], shift, mu }
-    }
-
-    #[inline]
-    fn predict(&self) -> i32 {
-        let mut dot: i64 = 0;
-        for i in 0..self.w.len() {
-            dot += self.w[i] as i64 * self.hist[i] as i64;
-        }
-        (dot >> self.shift) as i32
-    }
-
-    /// Adapt toward `actual`, then push it into the history.
-    #[inline]
-    fn update(&mut self, actual: i32, pred: i32) {
-        let err = actual - pred;
-        if err != 0 {
-            let s = if err > 0 { self.mu } else { -self.mu };
-            for i in 0..self.w.len() {
-                self.w[i] += match self.hist[i].cmp(&0) {
-                    std::cmp::Ordering::Greater => s,
-                    std::cmp::Ordering::Less => -s,
-                    std::cmp::Ordering::Equal => 0,
-                };
-            }
-        }
-        self.hist.rotate_right(1);
-        self.hist[0] = actual;
-    }
-}
-
-/// (order, weight shift, adaptation step) per stage. Shift and step trade off
-/// against each other — halving the shift is the same as doubling the step — so
-/// what these encode is really one adaptation rate per stage, tuned on music.
-const LMS_STAGES: [(usize, u32, i32); 2] = [(24, 11, 2), (256, 12, 1)];
-
-// forward()/inverse() unroll the cascade by hand, so a third entry here would be
-// constructed and then silently never consulted.
-const _: () = assert!(LMS_STAGES.len() == 2, "cascade is unrolled for exactly two stages");
-
-/// A fixed 2nd-order extrapolation followed by adaptive stages, each predicting
-/// the previous stage's residual.
-///
-/// The fixed stage matters more than it looks. An LMS filter starts from zero
-/// weights, so without it the filter has to *learn* that audio is smooth before
-/// it can predict anything — paying full price for the first few thousand
-/// samples of every file, and never quite recovering the slope term. Standing it
-/// on `2*x[n-1] - x[n-2]` means the adaptive stages only ever model what a
-/// straight line through the last two samples failed to capture.
-struct LmsCascade {
-    h1: i32,
-    h2: i32,
-    stages: Vec<Lms>,
-}
-
-impl LmsCascade {
-    fn new() -> Self {
-        // A short fast-adapting filter catches the local waveform slope; the long
-        // slow one catches periodicity (pitch, room tone) the short one cannot see.
-        Self { h1: 0, h2: 0, stages: LMS_STAGES.iter().map(|&(o, s, m)| Lms::new(o, s, m)).collect() }
-    }
-
-    #[inline]
-    fn fixed_pred(&self) -> i32 {
-        2 * self.h1 - self.h2
-    }
-
-    #[inline]
-    fn push_fixed(&mut self, x: i32) {
-        self.h2 = self.h1;
-        self.h1 = x;
-    }
-
-    /// Forward: sample in, residual out.
-    ///
-    /// Every intermediate is reduced to 16 bits. That is not an optimisation —
-    /// it is what makes the transform invertible. Residuals are stored in 16
-    /// bits, so the decoder only ever learns them modulo 2^16; if the encoder
-    /// carried full-width intermediates, a prediction that overshot would leave
-    /// the decoder reconstructing a value 65536 away, and the two filter
-    /// histories would silently diverge from that sample on. Wrapping both sides
-    /// identically makes the arithmetic exact in the only sense that matters.
-    #[inline]
-    fn forward(&mut self, x: i32) -> i32 {
-        let p0 = self.fixed_pred();
-        let e0 = wrap16(x - p0);
-        let p1 = self.stages[0].predict();
-        let e1 = wrap16(e0 - p1);
-        self.stages[0].update(e0, p1);
-        let p2 = self.stages[1].predict();
-        let e2 = wrap16(e1 - p2);
-        self.stages[1].update(e1, p2);
-        self.push_fixed(x);
-        e2
-    }
-
-    /// Inverse: residual in, sample out. Unwinds `forward` stage by stage, with
-    /// the same wrapping at each step, so the filters see identical inputs.
-    #[inline]
-    fn inverse(&mut self, e2: i32) -> i32 {
-        let p0 = self.fixed_pred();
-        let p1 = self.stages[0].predict();
-        let p2 = self.stages[1].predict();
-        let e1 = wrap16(e2 + p2);
-        let e0 = wrap16(e1 + p1);
-        let x = wrap16(e0 + p0);
-        self.stages[0].update(e0, p1);
-        self.stages[1].update(e1, p2);
-        self.push_fixed(x);
-        x
-    }
-}
-
-/// Reduce to a signed 16-bit value. Both directions of the audio transform apply
-/// this at every stage so their arithmetic agrees exactly.
-#[inline]
-fn wrap16(v: i32) -> i32 {
-    (v as u16) as i16 as i32
-}
-
-struct WavFmt {
-    channels: usize,
-    data_off: usize,
-    data_len: usize,
-}
-
-/// Locate the `fmt ` and `data` chunks. Only 16-bit PCM is handled; anything
-/// else falls through and is compressed as ordinary bytes.
-fn wav_parse(d: &[u8]) -> Option<WavFmt> {
+/// Locate the `fmt ` and `data` chunks of an integer-PCM WAV: 8, 16, 24 or 32
+/// bits, one to eight channels, plain or WAVE_FORMAT_EXTENSIBLE. Float WAVs and
+/// compressed codecs fall through and are compressed as ordinary bytes.
+fn wav_parse(d: &[u8]) -> Option<Layout> {
     if d.len() < 44 || &d[0..4] != b"RIFF" || &d[8..12] != b"WAVE" {
         return None;
     }
+    let u16_at = |p: usize| u16::from_le_bytes([d[p], d[p + 1]]);
     let mut pos = 12usize;
-    let mut channels = 0usize;
-    let mut bits = 0usize;
-    let mut fmt_ok = false;
+    let mut fmt: Option<(usize, usize, usize)> = None; // channels, bits, block align
     while pos + 8 <= d.len() {
         let id = &d[pos..pos + 4];
         let sz = u32::from_le_bytes(d[pos + 4..pos + 8].try_into().ok()?) as usize;
-        if id == b"fmt " && pos + 24 <= d.len() {
-            let format = u16::from_le_bytes(d[pos + 8..pos + 10].try_into().ok()?);
-            channels = u16::from_le_bytes(d[pos + 10..pos + 12].try_into().ok()?) as usize;
-            bits = u16::from_le_bytes(d[pos + 22..pos + 24].try_into().ok()?) as usize;
-            fmt_ok = format == 1;
+        if id == b"fmt " && sz >= 16 && pos + 24 <= d.len() {
+            let mut tag = u16_at(pos + 8);
+            let channels = u16_at(pos + 10) as usize;
+            let align = u16_at(pos + 20) as usize;
+            let bits = u16_at(pos + 22) as usize;
+            if tag == WAVE_FORMAT_EXTENSIBLE && sz >= 40 && pos + 34 <= d.len() {
+                tag = u16_at(pos + 32); // first two bytes of the subformat GUID
+            }
+            fmt = (tag == WAVE_FORMAT_PCM).then_some((channels, bits, align));
         }
         if id == b"data" {
+            let (channels, bits, align) = fmt?;
+            let width = bits.div_ceil(8);
+            if !(1..=4).contains(&width) || !(1..=8).contains(&channels) || align != width * channels {
+                return None;
+            }
             let off = pos + 8;
             let len = sz.min(d.len().saturating_sub(off));
-            if !fmt_ok || bits != 16 || channels == 0 || channels > 2 {
+            // whole frames only; a ragged tail is left as ordinary bytes
+            let frames = len / align;
+            if frames < 16 {
                 return None;
             }
-            // whole frames only; a ragged tail is left untransformed
-            let len = len - (len % (2 * channels));
-            if len == 0 {
-                return None;
-            }
-            return Some(WavFmt { channels, data_off: off, data_len: len });
+            let mut lay = Layout {
+                kind: front::KIND_AUDIO,
+                off,
+                count: frames * channels,
+                width: width as u8,
+                shift: 0,
+                flags: if width == 1 { 0 } else { front::LAY_SIGNED },
+                chans: channels as u8,
+                row: 0,
+                stride: 0,
+            };
+            lay.detect_shift(d);
+            return Some(lay);
         }
         pos = pos.checked_add(8)?.checked_add(sz)?.checked_add(sz & 1)?;
     }
     None
 }
 
-/// Apply (or undo) the audio transform in place over the data chunk. Everything
-/// outside that chunk — headers, trailing metadata — is left byte-for-byte alone.
-fn wav_transform(data: &mut [u8], forward: bool) -> bool {
-    let Some(f) = wav_parse(data) else { return false };
-    let (off, ch) = (f.data_off, f.channels);
-    let frames = f.data_len / (2 * ch);
-    let body = &mut data[off..off + f.data_len];
+// ---------------------------------------------------------------------------
+// Image detection: uncompressed raster formats whose headers say exactly where
+// the pixels are. The image model itself lives in front.rs.
+// ---------------------------------------------------------------------------
 
-    let mut filters: Vec<LmsCascade> = (0..ch).map(|_| LmsCascade::new()).collect();
-    let mut out = vec![0u16; frames * ch];
-
-    if forward {
-        // gather interleaved samples, decorrelate, filter, zigzag
-        for n in 0..frames {
-            let mut s = [0i32; 2];
-            for c in 0..ch {
-                let i = (n * ch + c) * 2;
-                s[c] = i16::from_le_bytes([body[i], body[i + 1]]) as i32;
-            }
-            if ch == 2 {
-                // L-R needs 17 bits, so wrap it: the inverse works modulo 2^16
-                // too, and both channels are recovered exactly because the
-                // originals are known to be 16-bit.
-                let side = wrap16(s[0] - s[1]);
-                let mid = wrap16(s[1] + (side >> 1));
-                s = [mid, side];
-            }
-            for c in 0..ch {
-                let r = filters[c].forward(s[c]);
-                out[n * ch + c] = zigzag16(r);
-            }
-        }
-        // byte planes: all high bytes, then all low bytes
-        let total = frames * ch;
-        for (k, v) in out.iter().enumerate() {
-            body[k] = (v >> 8) as u8;
-            body[total + k] = (*v & 0xff) as u8;
-        }
-    } else {
-        let total = frames * ch;
-        for k in 0..total {
-            out[k] = ((body[k] as u16) << 8) | body[total + k] as u16;
-        }
-        for n in 0..frames {
-            let mut s = [0i32; 2];
-            for c in 0..ch {
-                s[c] = filters[c].inverse(unzigzag16(out[n * ch + c]));
-            }
-            if ch == 2 {
-                let (mid, side) = (s[0], s[1]);
-                let r = wrap16(mid - (side >> 1));
-                s = [wrap16(side + r), r];
-            }
-            for c in 0..ch {
-                let i = (n * ch + c) * 2;
-                let b = (s[c] as i16).to_le_bytes();
-                body[i] = b[0];
-                body[i + 1] = b[1];
-            }
-        }
+/// Build and bounds-check an image layout. Pixel samples are unsigned in all
+/// these formats.
+fn image_layout(d: &[u8], off: usize, w: usize, h: usize, comps: usize, width: usize, stride: usize, be: bool) -> Option<Layout> {
+    let row = w.checked_mul(comps)?;
+    if w == 0 || h < 2 || row > (1 << 24) || stride < row * width || stride > (1 << 28) {
+        return None;
     }
-    true
+    let end = off.checked_add(h.checked_mul(stride)?)?;
+    if end > d.len() || h * row < 4096 {
+        return None;
+    }
+    let mut lay = Layout {
+        kind: front::KIND_IMAGE,
+        off,
+        count: h * row,
+        width: width as u8,
+        shift: 0,
+        flags: if be { front::LAY_BE } else { 0 },
+        chans: comps as u8,
+        row,
+        stride,
+    };
+    lay.detect_shift(d);
+    Some(lay)
+}
+
+/// Binary PGM/PPM (P5/P6), 8 or 16 bits per sample.
+fn pnm_parse(d: &[u8]) -> Option<Layout> {
+    if d.len() < 16 || d[0] != b'P' || !(d[1] == b'5' || d[1] == b'6') {
+        return None;
+    }
+    let comps = if d[1] == b'6' { 3 } else { 1 };
+    let mut pos = 2;
+    let mut vals = [0usize; 3];
+    for v in vals.iter_mut() {
+        // whitespace and comments between tokens
+        loop {
+            match d.get(pos)? {
+                b'#' => {
+                    while *d.get(pos)? != b'\n' {
+                        pos += 1;
+                    }
+                }
+                c if c.is_ascii_whitespace() => pos += 1,
+                _ => break,
+            }
+        }
+        let st = pos;
+        while d.get(pos)?.is_ascii_digit() {
+            pos += 1;
+        }
+        *v = std::str::from_utf8(&d[st..pos]).ok()?.parse().ok()?;
+    }
+    if !d.get(pos)?.is_ascii_whitespace() {
+        return None;
+    }
+    let [w, h, maxval] = vals;
+    let width = if maxval < 256 { 1 } else if maxval < 65536 { 2 } else { return None };
+    image_layout(d, pos + 1, w, h, comps, width, w * comps * width, true)
+}
+
+/// Uncompressed Windows bitmap: 24/32-bit, or 8-bit with a grey palette.
+fn bmp_parse(d: &[u8]) -> Option<Layout> {
+    if d.len() < 54 || &d[0..2] != b"BM" {
+        return None;
+    }
+    let u32_at = |p: usize| u32::from_le_bytes(d[p..p + 4].try_into().unwrap());
+    let off = u32_at(10) as usize;
+    let w = u32_at(18) as i32;
+    let h = u32_at(22) as i32;
+    let bpp = u16::from_le_bytes([d[28], d[29]]) as usize;
+    let compression = u32_at(30);
+    if w <= 0 || h == 0 || !(compression == 0 || (compression == 3 && bpp == 32)) {
+        return None;
+    }
+    let (w, h) = (w as usize, h.unsigned_abs() as usize);
+    let comps = match bpp {
+        24 => 3,
+        32 => 4,
+        8 => {
+            // palette indices are only numbers if the palette is a grey ramp
+            let pal = 14 + u32_at(14) as usize;
+            if pal + 1024 > off {
+                return None;
+            }
+            let grey = (0..256).all(|i| d[pal + 4 * i..pal + 4 * i + 3].iter().all(|&c| c as usize == i));
+            if !grey {
+                return None;
+            }
+            1
+        }
+        _ => return None,
+    };
+    let stride = (w * bpp).div_ceil(32) * 4;
+    image_layout(d, off, w, h, comps, 1, stride, false)
+}
+
+/// Uncompressed Targa: truecolour (type 2) or greyscale (type 3).
+fn tga_parse(d: &[u8]) -> Option<Layout> {
+    if d.len() < 18 || !(d[2] == 2 || d[2] == 3) || d[1] > 1 {
+        return None;
+    }
+    let cmap_len = u16::from_le_bytes([d[5], d[6]]) as usize;
+    let cmap_bits = d[7] as usize;
+    let w = u16::from_le_bytes([d[12], d[13]]) as usize;
+    let h = u16::from_le_bytes([d[14], d[15]]) as usize;
+    let comps = match (d[2], d[16]) {
+        (2, 24) => 3,
+        (2, 32) => 4,
+        (3, 8) => 1,
+        _ => return None,
+    };
+    let off = 18 + d[0] as usize + if d[1] == 1 { cmap_len * cmap_bits.div_ceil(8) } else { 0 };
+    image_layout(d, off, w, h, comps, 1, w * comps, false)
+}
+
+fn image_parse(d: &[u8]) -> Option<Layout> {
+    pnm_parse(d).or_else(|| bmp_parse(d)).or_else(|| tga_parse(d))
 }
 
 /// Map a signed residual into u16 with small magnitudes near zero. The value is
@@ -3082,40 +3124,134 @@ fn img_helps(data: &[u8], g: ImgGeom, mode: Mode) -> bool {
     encode_stream_img(&xf, mode, mb, g0).len() < encode_stream(plain, mode, mb).len()
 }
 
-const MAGIC: [u8; 4] = *b"AUGR";
-const VERSION: u8 = 3; // 3: slot-based contexts, 16-bit coding — not readable by v2 decoders
-const HEADER_LEN: usize = 16;
-const FLAG_E8E9: u8 = 1;
-const FLAG_WAV: u8 = 2;
-/// Raw 16-bit image; the header is followed by width (u32 LE) and parity (u8).
-const FLAG_IMG: u8 = 4;
-const IMG_EXT_LEN: usize = 5;
-
+/// Code a plain buffer (trial encodes for the transform decisions).
 fn encode_stream(data: &[u8], mode: Mode, mem_bits: usize) -> Vec<u8> {
     encode_stream_img(data, mode, mem_bits, None)
 }
 
 fn encode_stream_img(data: &[u8], mode: Mode, mem_bits: usize, img: Option<ImgGeom>) -> Vec<u8> {
+    let mut enc = Encoder::new();
     let mut pr = Predictor::new(mode, mem_bits);
     pr.set_image(img);
-    let mut enc = Encoder::new();
     for &byte in data {
-        for i in (0..8).rev() {
-            let bit = ((byte >> i) & 1) as u32;
-            let p = pr.predict();
-            enc.encode(bit, p);
-            pr.update(bit);
-        }
+        code_byte(&mut pr, &mut enc, byte);
     }
     enc.finish()
 }
 
-fn decode_stream(stream: &[u8], mode: Mode, mem_bits: usize, orig_len: usize, img: Option<ImgGeom>) -> Vec<u8> {
+/// Where coded bits go: the arithmetic coder, or (for analysis) a cost tally.
+trait BitSink {
+    fn bit(&mut self, bit: u32, p: u32);
+    /// Called after each byte, for sinks that account per byte.
+    fn byte_done(&mut self) {}
+}
+
+impl BitSink for Encoder {
+    #[inline]
+    fn bit(&mut self, bit: u32, p: u32) {
+        self.encode(bit, p);
+    }
+}
+
+/// Per-byte coding cost in bits, for the `costs` analysis command.
+struct CostSink {
+    cur: f64,
+    out: Vec<f32>,
+}
+
+impl BitSink for CostSink {
+    fn bit(&mut self, bit: u32, p: u32) {
+        let p = p as f64 / 65536.0;
+        self.cur -= (if bit == 1 { p } else { 1.0 - p }).log2();
+    }
+    fn byte_done(&mut self) {
+        self.out.push(self.cur as f32);
+        self.cur = 0.0;
+    }
+}
+
+#[inline]
+fn code_byte(pr: &mut Predictor, enc: &mut impl BitSink, byte: u8) {
+    for i in (0..8).rev() {
+        let bit = ((byte >> i) & 1) as u32;
+        let p = pr.predict();
+        enc.bit(bit, p);
+        pr.update(bit);
+    }
+    enc.byte_done();
+}
+
+/// Coded-stream start of each sample region: residuals can be narrower than
+/// the samples (wasted bits), so later regions shift left by what earlier ones
+/// saved. `base` is where the virtual stream begins in the coded stream.
+fn coded_starts(lays: &[Layout], base: usize) -> Vec<(usize, Layout)> {
+    let mut shrink = 0;
+    lays.iter()
+        .map(|l| {
+            let at = base + l.off - shrink;
+            shrink += l.count * (l.width as usize - l.code_bytes());
+            (at, *l)
+        })
+        .collect()
+}
+
+fn coded_len(virt_len: usize, lays: &[Layout]) -> usize {
+    virt_len - lays.iter().map(|l| l.count * (l.width as usize - l.code_bytes())).sum::<usize>()
+}
+
+/// Length of the coded prefix (recipe length + recipe) when the recipe is
+/// empty, as it is for every FLAG_IMG stream.
+fn empty_prefix_len() -> usize {
+    4 + recomp::recipe_bytes(&[], &[]).len()
+}
+
+/// Code `prefix` (the recipe) then the virtual stream, with every sample
+/// region coded as residuals through its front-end.
+fn encode_into(enc: &mut impl BitSink, prefix: &[u8], virt: &[u8], mode: Mode, mem_bits: usize, img: Option<ImgGeom>, lays: &[Layout]) {
     let mut pr = Predictor::new(mode, mem_bits);
-    pr.set_image(img);
+    pr.set_image(img.map(|g| ImgGeom { parity: g.parity + prefix.len(), ..g }));
+    for &byte in prefix {
+        code_byte(&mut pr, enc, byte);
+    }
+    pr.set_fronts(coded_starts(lays, prefix.len()));
+    let mut pos = 0;
+    for l in lays {
+        for &byte in &virt[pos..l.off] {
+            code_byte(&mut pr, enc, byte);
+        }
+        if l.kind == front::KIND_JPEG {
+            // passed through: the front-end only predicts
+            for &byte in &virt[l.off..l.end()] {
+                code_byte(&mut pr, enc, byte);
+            }
+            pos = l.end();
+            continue;
+        }
+        let cb = l.code_bytes();
+        for s in 0..l.count {
+            let b = pr.front.as_ref().expect("front-end attached at its region").code(l.read(virt, s));
+            for &byte in &b[..cb] {
+                code_byte(&mut pr, enc, byte);
+            }
+        }
+        for g in l.gaps() {
+            for &byte in &virt[g] {
+                code_byte(&mut pr, enc, byte);
+            }
+        }
+        pos = l.end();
+    }
+    for &byte in &virt[pos..] {
+        code_byte(&mut pr, enc, byte);
+    }
+}
+
+/// Inverse of encode_into: returns (recipe, virtual stream), or an error for
+/// a stream that cannot be ours.
+fn decode_virt(stream: &[u8], mode: Mode, mem_bits: usize, virt_len: usize, img: Option<ImgGeom>) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut pr = Predictor::new(mode, mem_bits);
     let mut dec = Decoder::new(stream);
-    let mut out = Vec::with_capacity(orig_len);
-    for _ in 0..orig_len {
+    let mut next = |pr: &mut Predictor| -> u8 {
         let mut byte = 0u8;
         for _ in 0..8 {
             let p = pr.predict();
@@ -3123,40 +3259,108 @@ fn decode_stream(stream: &[u8], mode: Mode, mem_bits: usize, orig_len: usize, im
             pr.update(bit);
             byte = (byte << 1) | bit as u8;
         }
-        out.push(byte);
+        byte
+    };
+    // the prefix: recipe length, then the recipe
+    let mut len4 = [0u8; 4];
+    // the image geometry is offset by the prefix, whose length is not known
+    // yet; it only matters for FLAG_IMG streams, which carry an empty recipe
+    pr.set_image(img.map(|g| ImgGeom { parity: g.parity + empty_prefix_len(), ..g }));
+    for b in len4.iter_mut() {
+        *b = next(&mut pr);
     }
-    out
+    let rlen = u32::from_le_bytes(len4) as usize;
+    if rlen > stream.len().saturating_mul(64).max(1 << 20) {
+        return Err("corrupt augur stream (recipe length)".into());
+    }
+    let mut recipe = Vec::with_capacity(rlen);
+    for _ in 0..rlen {
+        recipe.push(next(&mut pr));
+    }
+    let (_, lays) = recomp::parse_recipe(&recipe, virt_len).ok_or("corrupt augur stream (recipe)")?;
+    let base = 4 + rlen;
+    pr.set_fronts(coded_starts(&lays, base));
+    let total = coded_len(virt_len, &lays);
+    let mut coded = Vec::with_capacity(total);
+    for _ in 0..total {
+        coded.push(next(&mut pr));
+    }
+    // reassemble: raw bytes from the coded stream, samples from the front-ends
+    if let Some(f) = pr.front.take() {
+        pr.done.push(f.into_samples());
+    }
+    let mut virt = vec![0u8; virt_len];
+    let (mut vpos, mut cpos) = (0usize, 0usize);
+    for (k, l) in lays.iter().enumerate() {
+        let n = l.off - vpos;
+        virt[vpos..l.off].copy_from_slice(&coded[cpos..cpos + n]);
+        cpos += n;
+        if l.kind == front::KIND_JPEG {
+            virt[l.off..l.end()].copy_from_slice(&coded[cpos..cpos + l.count]);
+            cpos += l.count;
+            vpos = l.end();
+            continue;
+        }
+        let samples = pr.done.get(k).ok_or("corrupt augur stream (sample region)")?;
+        if samples.len() != l.count {
+            return Err("corrupt augur stream (sample count)".into());
+        }
+        for (s, &x) in samples.iter().enumerate() {
+            l.write(&mut virt, s, x as i64);
+        }
+        cpos += l.count * l.code_bytes();
+        for g in l.gaps() {
+            let n = g.len();
+            virt[g].copy_from_slice(&coded[cpos..cpos + n]);
+            cpos += n;
+        }
+        vpos = l.end();
+    }
+    virt[vpos..].copy_from_slice(&coded[cpos..]);
+    Ok((recipe, virt))
 }
 
+// Container layout (version 5):
+//   "AUGR" | version(1) | mode(1) | mem_bits(1) | flags(1) | orig_len(8) | virt_len(8)
+//   [image geometry, if FLAG_IMG] | coded stream
+// The coded stream begins with the recipe (its length as u32 LE, then the
+// recipe) so the decoder learns the sample layouts before it reaches them.
+const MAGIC: [u8; 4] = *b"AUGR";
+const VERSION: u8 = 5; // 5: recompression recipes and multiple sample regions
+const HEADER_LEN: usize = 24;
+const FLAG_E8E9: u8 = 1;
+/// Raw 16-bit image; the header is followed by width (u32 LE) and parity (u8).
+const FLAG_IMG: u8 = 4;
+const IMG_EXT_LEN: usize = 5;
+
 fn compress(data: &[u8]) -> Vec<u8> {
-    let mode = sniff(data);
-    let mem_bits = mem_bits_for(data.len());
-    let mut flags = 0u8;
-    let mut owned;
-    let mut body = data;
-    let mut img_geom = None;
-    if wav_parse(data).is_some() {
-        // 16-bit PCM: predict each sample from its neighbours and code the residual
-        let mut t = data.to_vec();
-        if wav_transform(&mut t, true) {
-            flags |= FLAG_WAV;
-            owned = t;
-            body = &owned;
-        }
-    } else if let Some(g) = img_detect(data).filter(|&g| mode == Mode::Generic && img_helps(data, g, mode)) {
-        flags |= FLAG_IMG;
-        owned = data.to_vec();
-        img_transform(&mut owned, g, true);
-        body = &owned;
-        img_geom = Some(g);
-    } else if mode == Mode::Generic && e8e9_helps(data, mode) {
-        // only unstructured data is a plausible carrier for machine code
-        flags |= FLAG_E8E9;
-        owned = data.to_vec();
-        e8e9(&mut owned, true);
-        body = &owned;
+    let mut ex = recomp::expand(data);
+    // a recipe is only as good as its rebuild; never ship one that fails
+    if !ex.pieces.is_empty() && recomp::rebuild(&ex.virt, &ex.pieces).as_deref() != Some(data) {
+        ex = recomp::Expanded { virt: data.to_vec(), pieces: Vec::new(), layouts: Vec::new() };
     }
-    let stream = encode_stream_img(body, mode, mem_bits, img_geom);
+    let mode = sniff(&ex.virt);
+    let mem_bits = mem_bits_for(ex.virt.len());
+    let mut flags = 0u8;
+    let mut img_geom = None;
+    if ex.pieces.is_empty() && ex.layouts.is_empty() {
+        if let Some(g) = img_detect(&ex.virt).filter(|&g| mode == Mode::Generic && img_helps(&ex.virt, g, mode)) {
+            flags |= FLAG_IMG;
+            img_transform(&mut ex.virt, g, true);
+            img_geom = Some(g);
+        } else if mode == Mode::Generic && e8e9_helps(&ex.virt, mode) {
+            // only unstructured data is a plausible carrier for machine code
+            flags |= FLAG_E8E9;
+            e8e9(&mut ex.virt, true);
+        }
+    }
+    let recipe = recomp::recipe_bytes(&ex.pieces, &ex.layouts);
+    let mut prefix = (recipe.len() as u32).to_le_bytes().to_vec();
+    prefix.extend_from_slice(&recipe);
+    debug_assert!(img_geom.is_none() || prefix.len() == empty_prefix_len());
+    let mut enc = Encoder::new();
+    encode_into(&mut enc, &prefix, &ex.virt, mode, mem_bits, img_geom, &ex.layouts);
+    let stream = enc.finish();
     let mut out = Vec::with_capacity(stream.len() + HEADER_LEN);
     out.extend_from_slice(&MAGIC);
     out.push(VERSION);
@@ -3164,6 +3368,7 @@ fn compress(data: &[u8]) -> Vec<u8> {
     out.push(mem_bits as u8);
     out.push(flags);
     out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(ex.virt.len() as u64).to_le_bytes());
     if let Some(g) = img_geom {
         out.extend_from_slice(&(g.width as u32).to_le_bytes());
         out.push(g.parity as u8);
@@ -3187,6 +3392,12 @@ fn decompress(container: &[u8]) -> Result<Vec<u8>, String> {
     }
     let flags = container[7];
     let orig_len = u64::from_le_bytes(container[8..16].try_into().unwrap()) as usize;
+    let virt_len = u64::from_le_bytes(container[16..24].try_into().unwrap()) as usize;
+    // a virtual stream is the original with packed streams unpacked; deflate
+    // tops out near 1032:1, so anything far beyond that is corruption
+    if virt_len > orig_len.saturating_mul(1100).max(1 << 20) || orig_len > virt_len.saturating_mul(1100).max(1 << 20) {
+        return Err("corrupt augur header (lengths)".into());
+    }
     let mut at = HEADER_LEN;
     let mut img = None;
     if flags & FLAG_IMG != 0 {
@@ -3201,17 +3412,19 @@ fn decompress(container: &[u8]) -> Result<Vec<u8>, String> {
         img = Some(ImgGeom { width, parity });
         at += IMG_EXT_LEN;
     }
-    let mut out = decode_stream(&container[at..], mode, mem_bits, orig_len, img);
+    let (recipe, mut virt) = decode_virt(&container[at..], mode, mem_bits, virt_len, img)?;
     if let Some(g) = img {
-        if out.len() > g.parity {
-            img_transform(&mut out, g, false);
+        if virt.len() > g.parity {
+            img_transform(&mut virt, g, false);
         }
     }
     if flags & FLAG_E8E9 != 0 {
-        e8e9(&mut out, false);
+        e8e9(&mut virt, false);
     }
-    if flags & FLAG_WAV != 0 {
-        wav_transform(&mut out, false);
+    let (pieces, _) = recomp::parse_recipe(&recipe, virt_len).ok_or("corrupt augur stream (recipe)")?;
+    let out = if pieces.is_empty() { virt } else { recomp::rebuild(&virt, &pieces).ok_or("corrupt augur stream (rebuild)")? };
+    if out.len() != orig_len {
+        return Err("corrupt augur stream (length mismatch)".into());
     }
     Ok(out)
 }
@@ -3223,21 +3436,94 @@ fn main() {
         Some("decompress") | Some("d") => cmd_decompress(&args[2..]),
         Some("bench") => cmd_bench(&args[2..]),
         Some("costs") => {
-            // analysis aid: per-byte coding cost in bits (f32 LE) -> <file>.costs
+            // analysis aid: per-coded-byte cost in bits (f32 LE) -> <file>.costs.
+            // Costs are of the coded stream: recipe first, sample regions as residuals.
             let d = read_or_die(&args[2]);
-            let mut pr = Predictor::new(sniff(&d), mem_bits_for(d.len()));
-            let mut out = Vec::with_capacity(d.len() * 4);
-            for &byte in &d {
-                let mut c = 0f64;
-                for i in (0..8).rev() {
-                    let bit = ((byte >> i) & 1) as u32;
-                    let p = pr.predict() as f64 / 65536.0;
-                    c -= (if bit == 1 { p } else { 1.0 - p }).log2();
-                    pr.update(bit);
-                }
-                out.extend_from_slice(&(c as f32).to_le_bytes());
-            }
+            let ex = recomp::expand(&d);
+            let recipe = recomp::recipe_bytes(&ex.pieces, &ex.layouts);
+            let mut prefix = (recipe.len() as u32).to_le_bytes().to_vec();
+            prefix.extend_from_slice(&recipe);
+            let mut sink = CostSink { cur: 0.0, out: Vec::new() };
+            encode_into(&mut sink, &prefix, &ex.virt, sniff(&ex.virt), mem_bits_for(ex.virt.len()), None, &ex.layouts);
+            let total: f64 = sink.out.iter().map(|&c| c as f64).sum();
+            eprintln!("{} coded bytes ({} prefix), {:.0} bytes of cost", sink.out.len(), prefix.len(), total / 8.0);
+            let out: Vec<u8> = sink.out.iter().flat_map(|c| c.to_le_bytes()).collect();
             write_or_die(&format!("{}.costs", args[2]), &out);
+        }
+        Some("zdeflate") => {
+            // test aid: augur zdeflate <level> <memlevel> <wbits> <strategy> <in> <out>
+            let n = |i: usize| args[i].parse::<u8>().expect("number");
+            let p = deflate::Params {
+                level: n(2),
+                mem_level: n(3),
+                wbits: n(4),
+                strategy: deflate::Strategy::from_u8(n(5)).expect("strategy"),
+            };
+            write_or_die(&args[7], &deflate::deflate(&read_or_die(&args[6]), p));
+        }
+        Some("zblocks") => {
+            // analysis aid: augur zblocks <raw deflate> [level memlevel wbits strategy]
+            // prints the stream's blocks, and with params, zlib's blocks for the same data
+            let d = read_or_die(&args[2]);
+            let r = deflate::inflate(&d, usize::MAX).expect("inflate failed");
+            let show = |name: &str, s: &[u8]| {
+                for (i, b) in deflate::inflate_blocks(s).unwrap().iter().enumerate().take(12) {
+                    println!("{name} #{i}: type {} out {}+{} syms {} matches {}", b.btype, b.out_start, b.out_len, b.symbols, b.matches);
+                }
+            };
+            show("orig", &d);
+            if args.len() >= 7 {
+                let n = |i: usize| args[i].parse::<u8>().unwrap();
+                let p = deflate::Params { level: n(3), mem_level: n(4), wbits: n(5), strategy: deflate::Strategy::from_u8(n(6)).unwrap() };
+                let z = deflate::deflate(&r.data, p);
+                show("zlib", &z);
+                let i = z.iter().zip(&d).position(|(a, b)| a != b).unwrap_or(z.len().min(d.len()));
+                println!("first differing byte {i} of {} / {}", d.len(), z.len());
+            }
+        }
+        Some("zdiff") => {
+            // analysis aid: augur zdiff <raw deflate> — what a reflate diff spends
+            println!("{}", reflate::stats(&read_or_die(&args[2])).unwrap_or_else(|| "not reflatable".into()));
+        }
+        Some("expand") => {
+            // analysis aid: what recompression finds in a file
+            let d = read_or_die(&args[2]);
+            let t = Instant::now();
+            let ex = recomp::expand(&d);
+            fn walk(ps: &[recomp::Piece], depth: usize, tally: &mut [usize; 4]) {
+                for p in ps {
+                    match p.kind {
+                        recomp::Kind::Deflate(_) => tally[0] += 1,
+                        recomp::Kind::Reflate { diff_len } => {
+                            tally[1] += 1;
+                            tally[3] += diff_len;
+                        }
+                        _ => tally[2] += 1,
+                    }
+                    walk(&p.children, depth + 1, tally);
+                }
+            }
+            let mut tally = [0usize; 4];
+            walk(&ex.pieces, 0, &mut tally);
+            let ok = recomp::rebuild(&ex.virt, &ex.pieces).as_deref() == Some(&d[..]);
+            println!(
+                "{}: {} -> virt {}  zlib-exact {}  reflate {} (diff {} B)  other pieces {}  sample regions {}  rebuild {}  {:.1}s",
+                args[2], d.len(), ex.virt.len(), tally[0], tally[1], tally[3], tally[2], ex.layouts.len(),
+                if ok { "OK" } else { "FAILED" }, t.elapsed().as_secs_f64()
+            );
+        }
+        Some("jcheck") => {
+            // analysis aid: does the JPEG model stay in sync with every scan?
+            let d = read_or_die(&args[2]);
+            for l in recomp::expand(&d).layouts.iter().filter(|l| l.kind == front::KIND_JPEG) {
+                println!("scan at {} ({} bytes): {}", l.off, l.count, if jpeg::follows_scan(&d, l.off, l.count) { "in sync" } else { "LOST" });
+            }
+        }
+        Some("zinflate") => {
+            // test aid: augur zinflate <raw deflate in> <out>
+            let r = deflate::inflate(&read_or_die(&args[2]), usize::MAX).expect("inflate failed");
+            eprintln!("consumed {}", r.consumed);
+            write_or_die(&args[3], &r.data);
         }
         Some("size") => {
             // tuning aid: compressed size only, no decode
@@ -3579,34 +3865,42 @@ mod tests {
         roundtrip(&data);
     }
 
-    fn make_wav(samples: &[(i16, i16)]) -> Vec<u8> {
-        let data_len = samples.len() * 4;
+    /// A WAV holding `frames` of `chans` samples, `bits` wide, from `f(frame, chan)`.
+    fn make_wav_n(chans: usize, bits: usize, frames: usize, f: impl Fn(usize, usize) -> i64) -> Vec<u8> {
+        let width = bits / 8;
+        let data_len = frames * chans * width;
         let mut w = Vec::new();
         w.extend_from_slice(b"RIFF");
         w.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
         w.extend_from_slice(b"WAVEfmt ");
         w.extend_from_slice(&16u32.to_le_bytes());
         w.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        w.extend_from_slice(&2u16.to_le_bytes()); // stereo
+        w.extend_from_slice(&(chans as u16).to_le_bytes());
         w.extend_from_slice(&44100u32.to_le_bytes());
-        w.extend_from_slice(&176_400u32.to_le_bytes());
-        w.extend_from_slice(&4u16.to_le_bytes());
-        w.extend_from_slice(&16u16.to_le_bytes());
+        w.extend_from_slice(&((44100 * chans * width) as u32).to_le_bytes());
+        w.extend_from_slice(&((chans * width) as u16).to_le_bytes());
+        w.extend_from_slice(&(bits as u16).to_le_bytes());
         w.extend_from_slice(b"data");
         w.extend_from_slice(&(data_len as u32).to_le_bytes());
-        for (l, r) in samples {
-            w.extend_from_slice(&l.to_le_bytes());
-            w.extend_from_slice(&r.to_le_bytes());
+        for n in 0..frames {
+            for c in 0..chans {
+                let v = f(n, c);
+                // 8-bit WAV is unsigned; wider is two's complement
+                let v = if bits == 8 { v + 128 } else { v };
+                w.extend_from_slice(&v.to_le_bytes()[..width]);
+            }
         }
         w
     }
 
+    fn make_wav(samples: &[(i16, i16)]) -> Vec<u8> {
+        make_wav_n(2, 16, samples.len(), |n, c| if c == 0 { samples[n].0 as i64 } else { samples[n].1 as i64 })
+    }
+
     #[test]
-    fn wav_transform_survives_adversarial_audio() {
-        // The residual is stored in 16 bits, so the decoder only learns it modulo
-        // 2^16. Anything that makes a prediction overshoot — full-scale content,
-        // sign flips, L-R needing a 17th bit — used to desync the filters. These
-        // are the signals that provoke it.
+    fn wav_survives_adversarial_audio() {
+        // Residuals are coded modulo 2^bits, so anything that makes a prediction
+        // overshoot — full-scale content, sign flips, noise — must still decode.
         let mut cases: Vec<Vec<(i16, i16)>> = Vec::new();
         cases.push((0..5000).map(|i| if i % 2 == 0 { (i16::MAX, i16::MIN) } else { (i16::MIN, i16::MAX) }).collect());
         cases.push((0..5000).map(|_| (i16::MAX, i16::MIN)).collect());
@@ -3615,12 +3909,7 @@ mod tests {
         cases.push(
             noise
                 .chunks(4)
-                .map(|c| {
-                    (
-                        i16::from_le_bytes([c[0], c[1]]),
-                        i16::from_le_bytes([c[2], c[3]]),
-                    )
-                })
+                .map(|c| (i16::from_le_bytes([c[0], c[1]]), i16::from_le_bytes([c[2], c[3]])))
                 .collect(),
         );
         // a loud sine, which is what real music's envelope looks like
@@ -3635,39 +3924,392 @@ mod tests {
         for c in cases {
             let wav = make_wav(&c);
             assert!(wav_parse(&wav).is_some(), "test wav should be recognised");
-            roundtrip(&wav);
+            assert_eq!(recomp::expand(&wav).layouts.len(), 1, "audio front-end should be used");
+            assert!(decompress(&compress(&wav)).unwrap() == wav, "roundtrip mismatch");
         }
     }
 
     #[test]
-    fn wav_transform_is_exactly_invertible() {
-        // direct check on the transform itself, independent of the coder
-        let c: Vec<(i16, i16)> = (0..3000)
-            .map(|i| {
-                let a = (i as i32 * 7919 % 65536 - 32768) as i16;
-                let b = (i as i32 * 104_729 % 65536 - 32768) as i16;
-                (a, b)
-            })
-            .collect();
-        let orig = make_wav(&c);
-        let mut t = orig.clone();
-        assert!(wav_transform(&mut t, true));
-        assert!(t != orig, "transform should change the data chunk");
-        assert!(wav_transform(&mut t, false));
-        assert!(t == orig, "wav transform must invert exactly");
+    fn every_pcm_shape_roundtrips() {
+        // bit depths, channel counts, and wasted low bits (a 24-bit file holding
+        // 16-bit audio) — each with full-scale swings to force wraparound
+        let noise = pseudo_random(1 << 16);
+        for &(chans, bits, shift) in &[(1, 8, 0), (2, 8, 0), (1, 16, 0), (2, 24, 0), (2, 24, 8), (6, 16, 0), (2, 32, 0), (3, 24, 4)] {
+            let max = (1i64 << (bits - 1)) - 1;
+            let wav = make_wav_n(chans, bits, 3000, |n, c| {
+                let v = if n % 500 < 3 {
+                    if (n + c) % 2 == 0 { max } else { -max - 1 }
+                } else {
+                    let s = ((n as f64 * 0.05 + c as f64).sin() * max as f64 * 0.7) as i64;
+                    s + (noise[(n * chans + c) % noise.len()] as i64 - 128) * (max >> 10).max(1)
+                };
+                (v.clamp(-max - 1, max) >> shift) << shift
+            });
+            let lay = wav_parse(&wav).unwrap_or_else(|| panic!("{chans}ch {bits}-bit not recognised"));
+            assert_eq!(lay.shift as usize, shift, "{chans}ch {bits}-bit: wasted bits");
+            let comp = compress(&wav);
+            assert!(decompress(&comp).unwrap() == wav, "{chans}ch {bits}-bit roundtrip mismatch");
+        }
+    }
+
+    #[test]
+    fn audio_tail_after_data_chunk_survives() {
+        // metadata after the samples, and a data chunk ending mid-frame
+        let mut w = make_wav_n(2, 16, 2000, |n, c| ((n * 37 + c * 11) % 2000) as i64 - 1000);
+        w.extend_from_slice(b"LIST\x04\x00\x00\x00abcd");
+        roundtrip(&w);
+        let mut t = make_wav_n(2, 24, 2000, |n, _| (n as i64 * 977) % 70000 - 35000);
+        let len = t.len();
+        t.truncate(len - 4); // ragged final frame
+        roundtrip(&t);
     }
 
     #[test]
     fn non_pcm_wav_is_left_alone() {
-        // 8-bit, 24-bit, multichannel and non-PCM must fall through untransformed
         let mut w = make_wav(&[(1, 2), (3, 4)]);
-        w[34] = 24; // bits per sample
+        w[20] = 3; // IEEE float, not PCM
         assert!(wav_parse(&w).is_none());
         roundtrip(&w);
-        let mut w2 = make_wav(&[(1, 2), (3, 4)]);
-        w2[20] = 3; // IEEE float, not PCM
+        let mut w2 = make_wav_n(2, 16, 100, |n, _| n as i64);
+        w2[32] = 3; // block align inconsistent with channels * width
         assert!(wav_parse(&w2).is_none());
         roundtrip(&w2);
+    }
+
+    /// A smooth synthetic picture with noise and a hard edge, `comps` samples per pixel.
+    fn picture(w: usize, h: usize, comps: usize) -> Vec<u8> {
+        let noise = pseudo_random(w * h * comps);
+        let mut v = Vec::with_capacity(w * h * comps);
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..comps {
+                    let base = if x > w / 2 && y > h / 3 { 230 } else { (x + 2 * y + 40 * c) % 200 };
+                    v.push((base + (noise[v.len()] as usize & 7)) as u8);
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn images_roundtrip_through_the_front_end() {
+        let (w, h) = (101, 67); // odd width: BMP rows need padding
+        // PPM and PGM
+        for (magic, comps) in [("P6", 3), ("P5", 1)] {
+            let mut f = format!("{magic}\n# a comment\n{w} {h}\n255\n").into_bytes();
+            f.extend_from_slice(&picture(w, h, comps));
+            f.extend_from_slice(b"trailing junk");
+            let lay = image_parse(&f).expect("pnm should be recognised");
+            assert_eq!((lay.chans as usize, lay.row), (comps, w * comps));
+            assert_eq!(recomp::expand(&f).layouts.len(), 1);
+            assert!(decompress(&compress(&f)).unwrap() == f, "{magic} roundtrip mismatch");
+        }
+        // 24-bit BMP, bottom-up, with row padding that must survive verbatim
+        let stride = (w * 3).div_ceil(4) * 4;
+        let mut b = vec![0u8; 54];
+        b[0..2].copy_from_slice(b"BM");
+        b[10..14].copy_from_slice(&54u32.to_le_bytes());
+        b[14..18].copy_from_slice(&40u32.to_le_bytes());
+        b[18..22].copy_from_slice(&(w as u32).to_le_bytes());
+        b[22..26].copy_from_slice(&(h as u32).to_le_bytes());
+        b[26] = 1;
+        b[28] = 24;
+        let px = picture(w, h, 3);
+        for y in 0..h {
+            b.extend_from_slice(&px[y * w * 3..(y + 1) * w * 3]);
+            b.extend_from_slice(&[0xAB, 0xCD, 0xEF][..stride - w * 3]); // non-zero padding
+        }
+        let lay = bmp_parse(&b).expect("bmp should be recognised");
+        assert_eq!(lay.stride, stride);
+        roundtrip(&b);
+        // 16-bit big-endian PGM with random samples (every prediction wrong)
+        let mut f = format!("P5 {w} {h} 65535\n").into_bytes();
+        f.extend_from_slice(&pseudo_random(w * h * 2));
+        assert_eq!(image_parse(&f).unwrap().width, 2);
+        roundtrip(&f);
+    }
+
+    #[test]
+    fn truncated_images_are_not_parsed() {
+        let mut f = b"P6\n100 100\n255\n".to_vec();
+        f.extend_from_slice(&pseudo_random(100 * 99 * 3)); // one row short
+        assert!(image_parse(&f).is_none());
+        roundtrip(&f);
+    }
+
+    fn zlib_wrap(raw: &[u8], level: u8) -> Vec<u8> {
+        let p = deflate::Params { level, mem_level: 8, wbits: 15, strategy: deflate::Strategy::Default };
+        let mut z = vec![0x78, 0xda];
+        z.extend_from_slice(&deflate::deflate(raw, p));
+        z.extend_from_slice(&recomp::adler32(raw).to_be_bytes());
+        z
+    }
+
+    /// A deflate encoder zlib would never produce: greedy, fixed Huffman,
+    /// small blocks — forces the reflate path.
+    fn odd_deflate(raw: &[u8]) -> Vec<u8> {
+        let mut bits: Vec<u8> = Vec::new();
+        let (mut acc, mut n) = (0u64, 0u32);
+        let mut send = |v: u32, len: u32, bits: &mut Vec<u8>| {
+            acc |= (v as u64) << n;
+            n += len;
+            while n >= 8 {
+                bits.push(acc as u8);
+                acc >>= 8;
+                n -= 8;
+            }
+        };
+        let rev = |v: u32, len: u32| (0..len).fold(0, |r, i| r | ((v >> i) & 1) << (len - 1 - i));
+        let lit = |c: usize| -> (u32, u32) {
+            match c {
+                0..=143 => (rev(0x30 + c as u32, 8), 8),
+                144..=255 => (rev(0x190 + c as u32 - 144, 9), 9),
+                256..=279 => (rev(c as u32 - 256, 7), 7),
+                _ => (rev(0xc0 + c as u32 - 280, 8), 8),
+            }
+        };
+        const DBASE: [usize; 17] = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257];
+        const DEXTRA: [u32; 17] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7];
+        let mut i = 0;
+        let starts: Vec<usize> = (0..raw.len()).step_by(700).collect();
+        for (k, &start) in starts.iter().enumerate() {
+            let end = (start + 700).min(raw.len());
+            send((k + 1 == starts.len()) as u32, 1, &mut bits);
+            send(1, 2, &mut bits);
+            while i < end {
+                // greedy: the nearest earlier 4-byte repeat within 300 bytes
+                let d = (1..=300.min(i)).find(|&d| i + 4 <= end && raw[i - d..i - d + 4] == raw[i..i + 4]);
+                if let Some(d) = d {
+                    let mut l = 4;
+                    while l < 10 && i + l < end && raw[i - d + l] == raw[i + l] {
+                        l += 1;
+                    }
+                    let (c, cl) = lit(257 + l - 3);
+                    send(c, cl, &mut bits); // lengths 3..10 have no extra bits
+                    let dk = DBASE.iter().rposition(|&b| b <= d).unwrap();
+                    send(rev(dk as u32, 5), 5, &mut bits);
+                    send((d - DBASE[dk]) as u32, DEXTRA[dk], &mut bits);
+                    i += l;
+                } else {
+                    let (c, cl) = lit(raw[i] as usize);
+                    send(c, cl, &mut bits);
+                    i += 1;
+                }
+            }
+            let (c, cl) = lit(256);
+            send(c, cl, &mut bits);
+        }
+        if n > 0 {
+            bits.push(acc as u8);
+        }
+        bits
+    }
+
+    fn text(n: usize) -> Vec<u8> {
+        let words = ["alpha ", "beta ", "gamma ", "delta\n", "epsilon ", "zeta, ", "eta "];
+        let r = pseudo_random(n);
+        (0..n).flat_map(|i| words[r[i] as usize % words.len()].bytes()).take(n).collect()
+    }
+
+    fn recomp_paeth(a: u8, b: u8, c: u8) -> u8 {
+        let p = a as i16 + b as i16 - c as i16;
+        let (pa, pb, pc) = ((p - a as i16).abs(), (p - b as i16).abs(), (p - c as i16).abs());
+        if pa <= pb && pa <= pc {
+            a
+        } else if pb <= pc {
+            b
+        } else {
+            c
+        }
+    }
+
+    /// A PNG whose rows use every filter type, its IDAT split in two.
+    fn png(w: usize, h: usize, color: u8, depth: u8, interlace: u8, pixels: &[u8], odd: bool) -> Vec<u8> {
+        let chans = match color {
+            0 | 3 => 1,
+            2 => 3,
+            4 => 2,
+            _ => 4,
+        };
+        let rowbytes = (w * chans * depth as usize).div_ceil(8);
+        let bpp = (chans * depth as usize).div_ceil(8);
+        let mut f = Vec::new();
+        for y in 0..h {
+            let t = (y % 5) as u8;
+            f.push(t);
+            for x in 0..rowbytes {
+                let a = if x >= bpp { pixels[y * rowbytes + x - bpp] } else { 0 };
+                let b = if y > 0 { pixels[(y - 1) * rowbytes + x] } else { 0 };
+                let c = if x >= bpp && y > 0 { pixels[(y - 1) * rowbytes + x - bpp] } else { 0 };
+                let p = match t {
+                    0 => 0,
+                    1 => a,
+                    2 => b,
+                    3 => ((a as u16 + b as u16) / 2) as u8,
+                    _ => recomp_paeth(a, b, c),
+                };
+                f.push(pixels[y * rowbytes + x].wrapping_sub(p));
+            }
+        }
+        let z = if odd {
+            let mut z = vec![0x78, 0x9c];
+            z.extend_from_slice(&odd_deflate(&f));
+            z.extend_from_slice(&recomp::adler32(&f).to_be_bytes());
+            z
+        } else {
+            zlib_wrap(&f, 9)
+        };
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let chunk = |ty: &[u8], data: &[u8], out: &mut Vec<u8>| {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let st = out.len();
+            out.extend_from_slice(ty);
+            out.extend_from_slice(data);
+            let c = recomp::crc32(&out[st..]);
+            out.extend_from_slice(&c.to_be_bytes());
+        };
+        let mut ihdr = (w as u32).to_be_bytes().to_vec();
+        ihdr.extend_from_slice(&(h as u32).to_be_bytes());
+        ihdr.extend_from_slice(&[depth, color, 0, 0, interlace]);
+        chunk(b"IHDR", &ihdr, &mut out);
+        let cut = z.len() / 3;
+        chunk(b"IDAT", &z[..cut], &mut out);
+        chunk(b"IDAT", &z[cut..], &mut out);
+        chunk(b"IEND", &[], &mut out);
+        out
+    }
+
+    #[test]
+    fn zlib_clone_matches_its_own_inflate() {
+        let data = text(50_000);
+        for level in 1..=9 {
+            for strategy in 0..5 {
+                let p = deflate::Params { level, mem_level: 8, wbits: 15, strategy: deflate::Strategy::from_u8(strategy).unwrap() };
+                let z = deflate::deflate(&data, p);
+                assert_eq!(deflate::inflate(&z, usize::MAX).unwrap().data, data, "L{level} S{strategy}");
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_streams_are_expanded_and_rebuilt() {
+        let body = text(40_000);
+        // zlib in noise, a gzip member, a zip entry, and a non-zlib stream
+        let mut f = pseudo_random(3000);
+        f.extend_from_slice(&zlib_wrap(&body, 6));
+        f.extend_from_slice(&pseudo_random(1000));
+        let mut gz = vec![0x1f, 0x8b, 8, 8, 0, 0, 0, 0, 2, 3];
+        gz.extend_from_slice(b"name.txt\0");
+        gz.extend_from_slice(&deflate::deflate(&body, deflate::Params { level: 9, mem_level: 8, wbits: 15, strategy: deflate::Strategy::Default }));
+        gz.extend_from_slice(&recomp::crc32(&body).to_le_bytes());
+        gz.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        f.extend_from_slice(&gz);
+        let odd = odd_deflate(&body[..20_000]);
+        let mut zip = b"PK\x03\x04\x14\x00\x00\x00\x08\x00".to_vec();
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&recomp::crc32(&body[..20_000]).to_le_bytes());
+        zip.extend_from_slice(&(odd.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&20_000u32.to_le_bytes());
+        zip.extend_from_slice(&5u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(b"a.txt");
+        zip.extend_from_slice(&odd);
+        f.extend_from_slice(&zip);
+        f.extend_from_slice(b"trailer");
+        let ex = recomp::expand(&f);
+        // the zlib and gzip streams are zlib's own; the zip entry's odd encoder
+        // is reflatable, but whether unpacking it pays is the trial's call
+        assert!(ex.pieces.len() >= 2, "zlib and gzip streams should be found");
+        assert!(ex.pieces[..2].iter().all(|p| matches!(p.kind, recomp::Kind::Deflate(_))));
+        let (raw, diff, used) = reflate::analyze(&odd, usize::MAX).expect("any valid stream is reflatable");
+        assert_eq!(used, odd.len());
+        assert_eq!(reflate::rebuild(&raw, &diff).unwrap(), odd);
+        assert_eq!(recomp::rebuild(&ex.virt, &ex.pieces).unwrap(), f);
+        let comp = compress(&f);
+        // 4 KB of the input is noise; the packed text should collapse around it
+        assert!(comp.len() < f.len() / 2, "unpacked text should compress well: {} of {}", comp.len(), f.len());
+        assert_eq!(decompress(&comp).unwrap(), f);
+    }
+
+    #[test]
+    fn pngs_of_every_kind_roundtrip() {
+        let (w, h) = (61, 37);
+        for &(color, depth) in &[(2u8, 8u8), (6, 8), (0, 8), (4, 8), (2, 16), (0, 16), (3, 8), (0, 1), (0, 4)] {
+            let chans = match color { 0 | 3 => 1, 2 => 3, 4 => 2, _ => 4 };
+            let rowbytes = (w * chans * depth as usize).div_ceil(8);
+            let pic = picture(rowbytes, h, 1);
+            for &(interlace, odd) in &[(0u8, false), (0, true), (1, false)] {
+                let f = png(w, h, color, depth, interlace, &pic, odd);
+                let ex = recomp::expand(&f);
+                assert_eq!(ex.pieces.len(), 1, "color {color} depth {depth} interlace {interlace} odd {odd}: not expanded");
+                let numeric = color != 3 && depth >= 8 && interlace == 0;
+                assert_eq!(ex.layouts.len(), numeric as usize, "color {color} depth {depth}: image layout");
+                let comp = compress(&f);
+                assert_eq!(decompress(&comp).unwrap(), f, "color {color} depth {depth} interlace {interlace} odd {odd}");
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_containers_fail_cleanly() {
+        // a PNG and an audio file: every recipe kind and a sample region
+        let pic = picture(64 * 3, 40, 1);
+        let mut inputs: Vec<Vec<u8>> = vec![png(64, 40, 2, 8, 0, &pic, true)];
+        inputs.push(make_wav_n(2, 16, 3000, |n, c| ((n * 31 + c * 7) % 4000) as i64 - 2000));
+        let noise = pseudo_random(4096);
+        for f in inputs {
+            let comp = compress(&f);
+            for k in 0..200 {
+                let mut bad = comp.clone();
+                let i = HEADER_LEN + (noise[k * 2] as usize * 256 + noise[k * 2 + 1] as usize) % (bad.len() - HEADER_LEN);
+                bad[i] ^= 1 << (k % 8);
+                // must not panic; an Ok result must at least have the right length
+                if let Ok(out) = decompress(&bad) {
+                    assert_eq!(out.len(), f.len());
+                }
+            }
+            for cut in [HEADER_LEN, HEADER_LEN + 3, comp.len() / 2] {
+                let _ = decompress(&comp[..cut]);
+            }
+        }
+    }
+
+    fn fixture(name: &str) -> Vec<u8> {
+        fs::read(format!("{}/testdata/{name}", env!("CARGO_MANIFEST_DIR"))).expect("test fixture")
+    }
+
+    #[test]
+    fn jpegs_are_modelled_and_roundtrip() {
+        for name in ["baseline.jpg", "restart.jpg", "gray.jpg", "sub420.jpg"] {
+            let f = fixture(name);
+            let ex = recomp::expand(&f);
+            assert_eq!(ex.layouts.len(), 1, "{name}: one scan region");
+            let l = ex.layouts[0];
+            assert_eq!(l.kind, front::KIND_JPEG);
+            assert!(jpeg::follows_scan(&f, l.off, l.count), "{name}: the model lost sync with the scan");
+            assert_eq!(decompress(&compress(&f)).unwrap(), f, "{name}");
+        }
+        // progressive JPEGs are left to the byte models, but must survive
+        let p = fixture("progressive.jpg");
+        assert!(recomp::expand(&p).layouts.is_empty());
+        assert_eq!(decompress(&compress(&p)).unwrap(), p);
+        // JPEGs inside other data, a truncated one, and one with a corrupt scan
+        let mut mixed = pseudo_random(2000);
+        mixed.extend_from_slice(&fixture("baseline.jpg"));
+        mixed.extend_from_slice(b"between");
+        mixed.extend_from_slice(&fixture("restart.jpg"));
+        let cut = fixture("sub420.jpg");
+        mixed.extend_from_slice(&cut[..cut.len() / 2]);
+        assert_eq!(recomp::expand(&mixed).layouts.len(), 2);
+        assert_eq!(decompress(&compress(&mixed)).unwrap(), mixed);
+        let mut bad = fixture("baseline.jpg");
+        let l = recomp::expand(&bad).layouts[0];
+        for i in (l.off..l.off + l.count).step_by(7) {
+            if bad[i] != 0xff && bad[i - 1] != 0xff {
+                bad[i] ^= 0x5a;
+            }
+        }
+        assert_eq!(decompress(&compress(&bad)).unwrap(), bad);
     }
 
     #[test]
