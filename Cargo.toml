@@ -3,9 +3,9 @@ name = "augur"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Structure-aware lossless compressor that beats xz on structured data by predicting, not packing."
+description = "Lossless context-mixing compressor that models what it compresses: structured text, audio, images, deflate containers and JPEG."
 repository = "https://github.com/B33BMO/augur"
-keywords = ["compression", "lossless", "context-mixing", "json", "csv"]
+keywords = ["compression", "lossless", "context-mixing", "png", "jpeg"]
 categories = ["compression", "command-line-utilities"]
 
 # augur — "predict, don't pack". A from-scratch context-mixing compressor.

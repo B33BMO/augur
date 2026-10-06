@@ -62,5 +62,8 @@ where bytes-at-rest are the cost and reads are rare.
 | `gh_events.ndjson` | first ~61 MB of the above, decompressed |
 | `enwik8` | first 10^8 bytes of a Wikipedia XML dump |
 
-Silesia is not yet wired in here; add it to `fetch.sh` before trusting the
-Silesia table in the top-level README.
+`fetch.sh` also unpacks Silesia into `data/silesia/`. The audio (EBU SQAM),
+image (Kodak), JPEG and deflate-container sets in the top-level README were
+assembled by hand from public sources: EBU SQAM from qc.ebu.io, Kodak from
+r0k.us, and the containers from arXiv, Maven Central, Project Gutenberg, PyPI
+and irs.gov. `zcheck.py` checks the zlib clone against the system zlib.
