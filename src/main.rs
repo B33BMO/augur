@@ -45,11 +45,15 @@ use std::fs;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+mod ctxbank;
 mod deflate;
 mod front;
+mod gif;
 mod jpeg;
 mod recomp;
 mod reflate;
+mod text;
+mod x86;
 use front::{Front, Layout, FRONT_IN};
 
 // ---------------------------------------------------------------------------
@@ -230,7 +234,7 @@ const FRONT0: usize = ORA0 + NMATCH + NREC + NRUN + 1; // first sample front-end
 const NIN: usize = FRONT0 + FRONT_IN; // contexts + match + record + run + numeric + front-end
 const MINLEN: usize = 6;
 const MINLEN_LONG: usize = 16;
-const CLIMIT: u16 = 8; // counter saturation: caps the slowest adaptation rate
+const CLIMIT: u16 = 15; // counter saturation: caps the slowest adaptation rate
 const LR: i32 = 15; // mixer learning rate (retuned for the two-layer mixer)
 const LR_SAMPLES: i32 = 8; // inside audio and image regions
 const APM_RATE: i32 = 8; // SSE adaptation shift
@@ -1136,6 +1140,8 @@ struct Predictor {
     img: Option<ImgGeom>, // set when coding the residuals of a raw 16-bit image
     front: Option<Box<Front>>, // numeric sample model running in lockstep (audio, images)
     pending: Vec<(usize, Layout)>, // regions still ahead, by coded start, last first
+    x86: Option<Box<x86::X86Model>>, // instruction-stream model, for executables
+    text: Box<text::TextModel>,      // word, gap, line and paragraph contexts
     done: Vec<Vec<i32>>,           // samples of the regions already coded, in order
     live: usize, // mixer inputs in use: the front-end's only exist when it does
     fast: bool,  // this bit is in a JPEG scan: the byte models are skipped
@@ -1257,6 +1263,8 @@ impl Predictor {
             img: None,
             front: None,
             pending: Vec::new(),
+            x86: None,
+            text: Box::new(text::TextModel::new()),
             done: Vec::new(),
             live: FRONT0,
             fast: false,
@@ -1348,6 +1356,11 @@ impl Predictor {
         self.img = img;
         self.recompute_ctx();
         self.select_slots();
+    }
+
+    /// Model the stream as x86 code (set from the container's E8E9 flag).
+    fn set_x86(&mut self, on: bool) {
+        self.x86 = on.then(|| Box::new(x86::X86Model::new()));
     }
 
     /// Schedule sample regions, each (coded start, layout), in order. Must be
@@ -1651,6 +1664,17 @@ impl Predictor {
     /// Front-end inputs, then the mixers and the SSE chain.
     #[inline]
     fn predict_mix(&mut self) -> u32 {
+        // outside sample regions the front-end inputs host the x86 model
+        if self.front.is_none() {
+            self.live = FRONT0;
+            if let Some(x) = self.x86.as_deref_mut().filter(|x| x.on) {
+                x.inputs(self.c0, &mut self.st[FRONT0..]);
+                self.live = FRONT0 + x86::X86_IN;
+            } else if self.text.on {
+                self.text.inputs(self.c0, &mut self.st[FRONT0..]);
+                self.live = FRONT0 + text::TEXT_IN;
+            }
+        }
         let in_samples = self.front.as_deref().is_some_and(|f| f.active() && f.sample_sels(0).is_some());
         (self.lr1, self.lr2) = if in_samples {
             // ~150 inputs of a different character: a gentler rate (swept: 8
@@ -1671,6 +1695,14 @@ impl Predictor {
         let last = *self.buf.last().unwrap_or(&0) as u32;
         let prev2 = if self.buf.len() >= 2 { self.buf[self.buf.len() - 2] as u32 } else { 0 };
         let mut sel = self.mixer_selectors(last);
+        if self.front.is_none() {
+            if let Some(x) = self.x86.as_deref().filter(|x| x.on) {
+                sel[4] = x.mixer_sel(self.bitpos);
+            } else if self.text.on && self.mode == Mode::Generic {
+                // the structure selector is constant outside structured modes
+                sel[3] = self.text.mixer_sel(self.bitpos);
+            }
+        }
         if let Some(f) = self.front.as_deref().filter(|f| f.active()) {
             sel[2] = f.mixer_sel(self.bitpos);
             if let Some([a, b, c, d]) = f.mixer_sels().or_else(|| f.sample_sels(self.bitpos)) {
@@ -1770,6 +1802,10 @@ impl Predictor {
         if let Some(f) = self.front.as_deref_mut().filter(|f| f.active()) {
             f.update(bit);
         }
+        if let Some(x) = self.x86.as_deref_mut() {
+            x.update(bit);
+        }
+        self.text.update(bit);
         self.mix2.update(&self.m1out, self.mix2out, bit, NMIX, self.lr2);
         for j in 0..NMIX {
             let out = self.m1out[j];
@@ -1968,6 +2004,10 @@ impl Predictor {
             Mode::Generic => self.update_struct_generic(byte),
         }
 
+        if let Some(x) = self.x86.as_deref_mut() {
+            x.byte(byte);
+        }
+        self.text.byte(byte, self.buf.len() - 1);
         self.attach_due();
         self.recompute_ctx();
     }
@@ -3247,9 +3287,10 @@ fn empty_prefix_len() -> usize {
 
 /// Code `prefix` (the recipe) then the virtual stream, with every sample
 /// region coded as residuals through its front-end.
-fn encode_into(enc: &mut impl BitSink, prefix: &[u8], virt: &[u8], mode: Mode, mem_bits: usize, img: Option<ImgGeom>, lays: &[Layout]) {
+fn encode_into(enc: &mut impl BitSink, prefix: &[u8], virt: &[u8], mode: Mode, mem_bits: usize, img: Option<ImgGeom>, lays: &[Layout], exe: bool) {
     let mut pr = Predictor::new(mode, mem_bits);
     pr.set_image(img.map(|g| ImgGeom { parity: g.parity + prefix.len(), ..g }));
+    pr.set_x86(exe || mode == Mode::Generic);
     for &byte in prefix {
         code_byte(&mut pr, enc, byte);
     }
@@ -3288,7 +3329,7 @@ fn encode_into(enc: &mut impl BitSink, prefix: &[u8], virt: &[u8], mode: Mode, m
 
 /// Inverse of encode_into: returns (recipe, virtual stream), or an error for
 /// a stream that cannot be ours.
-fn decode_virt(stream: &[u8], mode: Mode, mem_bits: usize, virt_len: usize, img: Option<ImgGeom>) -> Result<(Vec<u8>, Vec<u8>), String> {
+fn decode_virt(stream: &[u8], mode: Mode, mem_bits: usize, virt_len: usize, img: Option<ImgGeom>, exe: bool) -> Result<(Vec<u8>, Vec<u8>), String> {
     let mut pr = Predictor::new(mode, mem_bits);
     let mut dec = Decoder::new(stream);
     let mut next = |pr: &mut Predictor| -> u8 {
@@ -3306,6 +3347,7 @@ fn decode_virt(stream: &[u8], mode: Mode, mem_bits: usize, virt_len: usize, img:
     // the image geometry is offset by the prefix, whose length is not known
     // yet; it only matters for FLAG_IMG streams, which carry an empty recipe
     pr.set_image(img.map(|g| ImgGeom { parity: g.parity + empty_prefix_len(), ..g }));
+    pr.set_x86(exe || mode == Mode::Generic);
     for b in len4.iter_mut() {
         *b = next(&mut pr);
     }
@@ -3399,7 +3441,7 @@ fn compress(data: &[u8]) -> Vec<u8> {
     prefix.extend_from_slice(&recipe);
     debug_assert!(img_geom.is_none() || prefix.len() == empty_prefix_len());
     let mut enc = Encoder::new();
-    encode_into(&mut enc, &prefix, &ex.virt, mode, mem_bits, img_geom, &ex.layouts);
+    encode_into(&mut enc, &prefix, &ex.virt, mode, mem_bits, img_geom, &ex.layouts, flags & FLAG_E8E9 != 0);
     let stream = enc.finish();
     let mut out = Vec::with_capacity(stream.len() + HEADER_LEN);
     out.extend_from_slice(&MAGIC);
@@ -3452,7 +3494,7 @@ fn decompress(container: &[u8]) -> Result<Vec<u8>, String> {
         img = Some(ImgGeom { width, parity });
         at += IMG_EXT_LEN;
     }
-    let (recipe, mut virt) = decode_virt(&container[at..], mode, mem_bits, virt_len, img)?;
+    let (recipe, mut virt) = decode_virt(&container[at..], mode, mem_bits, virt_len, img, flags & FLAG_E8E9 != 0)?;
     if let Some(g) = img {
         if virt.len() > g.parity {
             img_transform(&mut virt, g, false);
@@ -3484,7 +3526,12 @@ fn main() {
             let mut prefix = (recipe.len() as u32).to_le_bytes().to_vec();
             prefix.extend_from_slice(&recipe);
             let mut sink = CostSink { cur: 0.0, out: Vec::new(), by_kind: [(0.0, 0); 17], kind: 16 };
-            encode_into(&mut sink, &prefix, &ex.virt, sniff(&ex.virt), mem_bits_for(ex.virt.len()), None, &ex.layouts);
+            let exe = e8e9_helps(&ex.virt, sniff(&ex.virt));
+            let mut v = ex.virt.clone();
+            if exe {
+                e8e9(&mut v, true);
+            }
+            encode_into(&mut sink, &prefix, &v, sniff(&ex.virt), mem_bits_for(ex.virt.len()), None, &ex.layouts, exe);
             let total: f64 = sink.out.iter().map(|&c| c as f64).sum();
             eprintln!("{} coded bytes ({} prefix), {:.0} bytes of cost", sink.out.len(), prefix.len(), total / 8.0);
             let names = ["code", "sign", "magnitude", "other"];
@@ -3558,12 +3605,22 @@ fn main() {
                 args[2], d.len(), ex.virt.len(), tally[0], tally[1], tally[3], tally[2], ex.layouts.len(),
                 if ok { "OK" } else { "FAILED" }, t.elapsed().as_secs_f64()
             );
+            if args.get(3).map(String::as_str) == Some("--layouts") {
+                for l in &ex.layouts {
+                    println!("layout kind {} off {} count {} width {}", l.kind, l.off, l.count, l.width);
+                }
+            }
         }
         Some("jcheck") => {
             // analysis aid: does the JPEG model stay in sync with every scan?
             let d = read_or_die(&args[2]);
             for l in recomp::expand(&d).layouts.iter().filter(|l| l.kind == front::KIND_JPEG) {
                 println!("scan at {} ({} bytes): {}", l.off, l.count, if jpeg::follows_scan(&d, l.off, l.count) { "in sync" } else { "LOST" });
+            }
+        }
+        Some("gifcheck") => {
+            for line in gif::diagnose(&read_or_die(&args[2])) {
+                println!("{line}");
             }
         }
         Some("zinflate") => {
@@ -4356,6 +4413,88 @@ mod tests {
                 bad[i] ^= 0x5a;
             }
         }
+        assert_eq!(decompress(&compress(&bad)).unwrap(), bad);
+    }
+
+    /// A GIF of `pixels` (w x h, 8-bit palette) coded with the given LZW choices.
+    fn make_gif(w: usize, h: usize, pixels: &[u8], lzw: &gif::Lzw, interlaced: bool) -> Vec<u8> {
+        let mut g = b"GIF89a".to_vec();
+        g.extend_from_slice(&(w as u16).to_le_bytes());
+        g.extend_from_slice(&(h as u16).to_le_bytes());
+        g.extend_from_slice(&[0xf7, 0, 0]); // 256-colour global table
+        for i in 0..256u32 {
+            g.extend_from_slice(&[i as u8, (i * 7) as u8, (255 - i) as u8]);
+        }
+        g.extend_from_slice(&[0x21, 0xfe, 5]);
+        g.extend_from_slice(b"hello");
+        g.push(0);
+        g.push(0x2c);
+        g.extend_from_slice(&[0, 0, 0, 0]);
+        g.extend_from_slice(&(w as u16).to_le_bytes());
+        g.extend_from_slice(&(h as u16).to_le_bytes());
+        g.push(if interlaced { 0x40 } else { 0 });
+        g.push(lzw.min_size);
+        let order: Vec<u8> = if interlaced {
+            gif::interlace_order(h).iter().flat_map(|&r| pixels[r * w..(r + 1) * w].iter().copied()).collect()
+        } else {
+            pixels.to_vec()
+        };
+        let codes = gif::encode(&order, lzw);
+        // sub-blocks as the Lzw asks; derive them from the code length
+        let mut l = lzw.clone();
+        if l.blocks.is_empty() {
+            l.blocks = vec![255; codes.len() / 255];
+            l.last_block = (codes.len() % 255) as u8;
+            if l.last_block == 0 && !l.blocks.is_empty() {
+                l.blocks.pop();
+                l.last_block = 255;
+            }
+        }
+        g.extend_from_slice(&gif::blocks(&codes, &l).unwrap());
+        g.push(0x3b);
+        g
+    }
+
+    #[test]
+    fn gifs_roundtrip_through_lzw_recompression() {
+        let (w, h) = (97, 61);
+        // few colours in flat regions, the way GIFs are
+        let pixels: Vec<u8> = picture(w, h, 1).iter().map(|&v| v / 16).collect();
+        let n = (w * h) as u32;
+        let base = gif::Lzw { min_size: 8, clears: vec![0], cuts: vec![], end_code: true, blocks: vec![], last_block: 0 };
+        let cases = [
+            base.clone(),
+            gif::Lzw { clears: vec![], ..base.clone() },              // no initial clear, never clears
+            gif::Lzw { clears: vec![0, n / 3, n / 2], ..base.clone() }, // early resets
+            gif::Lzw { end_code: false, ..base.clone() },
+            gif::Lzw { min_size: 4, ..base.clone() },
+            // an encoder that cuts strings short of greedy now and then
+            gif::Lzw { cuts: vec![(500, 1), (1200, 2), (3000, 1)], ..base.clone() },
+        ];
+        for (k, lzw) in cases.iter().enumerate() {
+            for interlaced in [false, true] {
+                let f = make_gif(w, h, &pixels, lzw, interlaced);
+                let ex = recomp::expand(&f);
+                assert_eq!(ex.pieces.len(), 1, "case {k} interlaced {interlaced}: not expanded");
+                assert_eq!(ex.layouts.len(), 1);
+                // the pixels are in display order whichever way the file stores them
+                let l = ex.layouts[0];
+                assert_eq!(&ex.virt[l.off..l.off + w * h], &pixels[..]);
+                assert_eq!(decompress(&compress(&f)).unwrap(), f, "case {k} interlaced {interlaced}");
+            }
+        }
+        // odd sub-block sizes survive
+        let mut odd = base.clone();
+        let codes = gif::encode(&pixels, &odd);
+        odd.blocks = vec![100; codes.len() / 100];
+        odd.last_block = (codes.len() % 100) as u8;
+        let f = make_gif(w, h, &pixels, &odd, false);
+        assert_eq!(recomp::expand(&f).pieces.len(), 1);
+        assert_eq!(decompress(&compress(&f)).unwrap(), f);
+        // a damaged LZW stream is left alone, but still roundtrips
+        let mut bad = make_gif(w, h, &pixels, &base, false);
+        let len = bad.len();
+        bad[len - 40] ^= 0x55;
         assert_eq!(decompress(&compress(&bad)).unwrap(), bad);
     }
 

@@ -11,6 +11,8 @@ What sets it apart is how much of a file it can *see into*:
 - **Images** — PPM/PGM, BMP, TGA, raw 16-bit rasters, and the pixels inside PNGs, through a 24-predictor image model with a colour cache.
 - **Anything deflated** — PNG, ZIP, gzip, PDF, DOCX/XLSX, JAR, EPUB. Streams are unpacked, modelled, and re-deflated **bit-exactly** on decompression: by a clean-room clone of zlib when zlib made them, and by a recorded description of the encoder's choices when something else did.
 - **JPEG** — baseline JPEG scans are decoded bit by bit as they are coded, and every Huffman bit is predicted from the neighbouring blocks' DCT coefficients.
+- **GIF** — LZW is undone and the palette indices go to the image model; re-encoding replays the encoder's clear codes and the rare places it cut a string short, bit for bit.
+- **x86 code** — instructions are decoded as they stream past, so each byte is modelled as the opcode, ModRM, displacement or immediate it is.
 
 It has **zero dependencies** (not even for the CLI).
 
@@ -174,7 +176,7 @@ The coded stream begins with the recipe (expansion tree and sample layouts), so 
 - **It is slow.** Generic data runs around 0.25 MB/s each way; audio, images and JPEG run at tens of KB/s, because every sample drives least-squares solves or every bit drives two dozen hashed lookups. Encode and decode cost about the same. This is a write-once, read-rarely compressor: archival, backups, cold storage.
 - **Memory is up to ~1 GB** for large inputs.
 - **paq8px is stronger** on prose, source code and executables (10–38% on Silesia's text and binary files), colour photographs (~15%), JPEG (~3.5 points of saving), and some audio. augur is ahead of every *practical* codec measured, not of every research one.
-- **Not yet handled:** progressive JPEG (coded as ordinary bytes), MP3/AAC, FLAC, GIF/LZW, xz/bzip2/zstd payloads. These pass through the generic models and gain little.
+- **Not yet handled:** progressive JPEG (coded as ordinary bytes), MP3/AAC, FLAC, xz/bzip2/zstd payloads. These pass through the generic models and gain little.
 - **Containers from v0.1 and earlier versions cannot be decoded** by this release; the format changed twice (versions 4 and 5).
 
 ## Testing

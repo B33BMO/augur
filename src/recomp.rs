@@ -25,6 +25,9 @@ pub enum Kind {
     /// The span is a reflate diff of `diff_len` bytes followed by the data;
     /// rebuild re-encodes the deflate stream the diff describes.
     Reflate { diff_len: usize },
+    /// The span is a GIF image's pixels (in display order); rebuild LZW-codes
+    /// them with the recorded choices and cuts the sub-blocks.
+    Gif { lzw: super::gif::Lzw, width: usize, height: usize, interlaced: bool },
     /// The span is `rows` filter-type bytes followed by `rows` rows of
     /// `rowbytes` unfiltered bytes; rebuild re-applies the PNG filters.
     Unfilter { rowbytes: usize, rows: usize, bpp: usize },
@@ -94,6 +97,48 @@ fn expand_into(data: &[u8], depth: u32, virt: &mut Vec<u8>, lays: &mut Vec<Layou
                 } else {
                     virt.extend_from_slice(&data[i..i + end]);
                 }
+                raw_from = i + end;
+                i += end;
+                continue;
+            }
+        }
+        if data[i] == b'G' && (data[i..].starts_with(b"GIF87a") || data[i..].starts_with(b"GIF89a")) {
+            if let Some((end, images)) = super::gif::scan(&data[i..]) {
+                virt.extend_from_slice(&data[raw_from..i]);
+                let mut at = 0;
+                for im in images {
+                    virt.extend_from_slice(&data[i + at..i + im.data_start]);
+                    let start = virt.len();
+                    // interlaced rows go back to display order, where the
+                    // row above is the row above
+                    let pixels = if im.interlaced {
+                        let mut v = vec![0u8; im.pixels.len()];
+                        for (k, &r) in super::gif::interlace_order(im.height).iter().enumerate() {
+                            v[r * im.width..(r + 1) * im.width].copy_from_slice(&im.pixels[k * im.width..(k + 1) * im.width]);
+                        }
+                        v
+                    } else {
+                        im.pixels
+                    };
+                    if im.width * im.height >= 1024 && im.height >= 2 {
+                        lays.push(Layout {
+                            kind: front::KIND_IMAGE,
+                            off: start,
+                            count: im.width * im.height,
+                            width: 1,
+                            shift: 0,
+                            flags: front::LAY_PALETTE,
+                            chans: 1,
+                            row: im.width,
+                            stride: im.width,
+                        });
+                    }
+                    virt.extend_from_slice(&pixels);
+                    let kind = Kind::Gif { lzw: im.lzw, width: im.width, height: im.height, interlaced: im.interlaced };
+                    pieces.push(Piece { start, virt_len: virt.len() - start, kind, children: Vec::new() });
+                    at = im.data_end;
+                }
+                virt.extend_from_slice(&data[i + at..i + end]);
                 raw_from = i + end;
                 i += end;
                 continue;
@@ -534,6 +579,21 @@ fn rebuild_span(virt: &[u8], lo: usize, hi: usize, pieces: &[Piece]) -> Option<V
                 let (diff, data) = inner.split_at_checked(*diff_len)?;
                 out.extend_from_slice(&super::reflate::rebuild(data, diff)?);
             }
+            Kind::Gif { lzw, width, height, interlaced } => {
+                if inner.len() != width.checked_mul(*height)? {
+                    return None;
+                }
+                let pixels = if *interlaced {
+                    let mut v = vec![0u8; inner.len()];
+                    for (k, &r) in super::gif::interlace_order(*height).iter().enumerate() {
+                        v[k * width..(k + 1) * width].copy_from_slice(&inner[r * width..(r + 1) * width]);
+                    }
+                    v
+                } else {
+                    inner
+                };
+                out.extend_from_slice(&super::gif::blocks(&super::gif::encode(&pixels, lzw), lzw)?);
+            }
             Kind::Idat(sizes) => {
                 let mut at = 0usize;
                 for &s in sizes {
@@ -610,6 +670,35 @@ fn put_pieces(out: &mut Vec<u8>, ps: &[Piece], mut prev_end: usize) {
                 out.push(4);
                 put_var(out, *diff_len as u64);
             }
+            Kind::Gif { lzw, width, height, interlaced } => {
+                out.push(5);
+                out.push(lzw.min_size | (lzw.end_code as u8) << 4 | (*interlaced as u8) << 5);
+                put_var(out, *width as u64);
+                put_var(out, *height as u64);
+                put_var(out, lzw.clears.len() as u64);
+                let mut prev = 0;
+                for &c in &lzw.clears {
+                    put_var(out, (c - prev) as u64);
+                    prev = c;
+                }
+                put_var(out, lzw.cuts.len() as u64);
+                let mut prev = 0;
+                for &(at, len) in &lzw.cuts {
+                    put_var(out, (at - prev) as u64);
+                    put_var(out, len as u64);
+                    prev = at;
+                }
+                // sub-blocks are nearly always full: then only their count
+                if lzw.blocks.iter().all(|&b| b == 255) {
+                    out.push(0);
+                    put_var(out, lzw.blocks.len() as u64);
+                } else {
+                    out.push(1);
+                    put_var(out, lzw.blocks.len() as u64);
+                    out.extend_from_slice(&lzw.blocks);
+                }
+                out.push(lzw.last_block);
+            }
             Kind::Unfilter { rowbytes, rows, bpp } => {
                 out.push(3);
                 put_var(out, *rowbytes as u64);
@@ -659,6 +748,52 @@ fn get_pieces(d: &[u8], p: &mut usize, depth: u32, mut prev_end: usize) -> Optio
             4 => {
                 *p += 1;
                 Kind::Reflate { diff_len: get_var(d, p)? as usize }
+            }
+            5 => {
+                let f = *d.get(*p + 1)?;
+                *p += 2;
+                let (width, height) = (get_var(d, p)? as usize, get_var(d, p)? as usize);
+                let n = get_var(d, p)? as usize;
+                if n > d.len() || width.checked_mul(height)? > 1 << 30 {
+                    return None;
+                }
+                let mut clears = Vec::with_capacity(n);
+                let mut acc = 0u32;
+                for _ in 0..n {
+                    acc = acc.checked_add(u32::try_from(get_var(d, p)?).ok()?)?;
+                    clears.push(acc);
+                }
+                let nc = get_var(d, p)? as usize;
+                if nc > d.len() {
+                    return None;
+                }
+                let mut cuts = Vec::with_capacity(nc);
+                let mut at = 0u32;
+                for _ in 0..nc {
+                    at = at.checked_add(u32::try_from(get_var(d, p)?).ok()?)?;
+                    cuts.push((at, u16::try_from(get_var(d, p)?).ok()?));
+                }
+                let mode = *d.get(*p)?;
+                *p += 1;
+                let nb = get_var(d, p)? as usize;
+                if nb > (1 << 30) / 255 {
+                    return None;
+                }
+                let blocks = if mode == 0 {
+                    vec![255u8; nb]
+                } else {
+                    let b = d.get(*p..*p + nb)?.to_vec();
+                    *p += nb;
+                    b
+                };
+                let last_block = *d.get(*p)?;
+                *p += 1;
+                let min_size = f & 15;
+                if !(2..=8).contains(&min_size) {
+                    return None;
+                }
+                let lzw = super::gif::Lzw { min_size, clears, cuts, end_code: f & 16 != 0, blocks, last_block };
+                Kind::Gif { lzw, width, height, interlaced: f & 32 != 0 }
             }
             3 => {
                 *p += 1;

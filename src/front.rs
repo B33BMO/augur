@@ -30,6 +30,8 @@ use super::{sm_init, sm_update, state_tab, stretch_tab, StateTab, RATE_TAB};
 
 pub const LAY_SIGNED: u8 = 1; // samples are two's complement (else offset binary, e.g. 8-bit WAV)
 pub const LAY_BE: u8 = 2; // big-endian (AIFF)
+/// Samples are palette indices: equal means equal, but near means nothing.
+pub const LAY_PALETTE: u8 = 4;
 
 /// Model selector stored in the container, so the decoder builds the same one.
 pub const KIND_AUDIO: u8 = 1;
@@ -688,6 +690,8 @@ const TAPS_WEST: [(u8, i8); 14] = [
 const TAPS_FAST: [(u8, i8); 6] = [(0, -3), (0, -2), (0, -1), (3, 0), (2, 0), (1, 0)];
 
 pub struct ImageModel {
+    palette: bool,
+    run: u32, // how far the current row's run of equal pixels has gone
     comps: usize,
     rowlen: usize,     // samples per row
     px: Vec<i32>,      // reconstructed samples, IMG_ROWS rows
@@ -735,10 +739,12 @@ fn med(w: i32, n: i32, nw: i32) -> i32 {
 }
 
 impl ImageModel {
-    fn new(width: usize, comps: usize, _bits: u32) -> Self {
+    fn new(width: usize, comps: usize, _bits: u32, palette: bool) -> Self {
         let rowlen = width * comps;
         let nx = |c: usize| 7 + if c > 0 { 5 } else { 0 } + if c > 1 { 3 } else { 0 };
         Self {
+            palette,
+            run: 0,
             comps,
             rowlen,
             px: vec![0; IMG_ROWS * rowlen],
@@ -1036,25 +1042,52 @@ impl ImageModel {
             let (wp1, wp2) = (before(0, -1, 1), before(0, -1, 2));
             let (np1, np2) = (before(1, 0, 1), before(1, 0, 2));
             let plane = (w + n - nw) >> 1;
+            if self.palette {
+                // indices: only equality means anything, so every context is
+                // an exact pattern of neighbours
+                let nne = g(2, 1);
+                let nee = g(1, 2);
+                let www = g(0, -3);
+                let run = self.run.min(31) as i32;
+                o.vctx = [
+                    hv(1, w, n, 0),
+                    hv(2, w, n, nw << 8 | ne),
+                    hv(3, n, ne, nne),
+                    hv(4, w, ww, www),
+                    hv(5, n, nn, 0),
+                    hv(6, w, nw, nn),
+                    hv(7, ne, nee, n),
+                    hv(8, w, run, 0),
+                    hv(9, n, run, (w == n) as i32),
+                    hv(10, w, n, ne << 8 | nne),
+                    hv(11, nw, n, ne),
+                    hv(12, w, ww, n << 8 | nn),
+                    hv(13, x as i32, n, 0),
+                    hv(14, w, (n == ne) as i32 | ((nw == n) as i32) << 1 | ((ww == w) as i32) << 2, ne),
+                    hv(15, n << 8 | nn, ne << 8 | nne, 0),
+                    hv(16, w << 8 | nw, n, ne << 8 | nee),
+                ];
+            } else {
             o.vctx = [
-                hv(1, w, n, 0),
-                hv(2, w, nw, 0),
-                hv(3, n, ne, 0),
-                hv(4, cb, w - bw, 0),
-                hv(5, cb, n - bn, 0),
-                hv(6, cb, c0v, 0),
-                hv(7, w + n - nw, 0, 0),
-                hv(8, m, gap, 0),
-                hv(9, cb + w - bw, cb + n - bn, 0),
-                hv(10, r(main), 0, 0),
-                hv(11, w >> 2, n >> 2, (nw >> 2) << 8 | (ne >> 2) & 255),
-                hv(12, r(main) >> 1, cb, 0),
-                // paq8px's strongest: the previous bytes against a neighbour's
-                hv(13, n, p1 - np1, p2 - np2),
-                hv(14, w, p1 - wp1, p2 - wp2),
-                hv(15, plane, p1, p2),
-                hv(16, p1, p2, 0),
-            ];
+                    hv(1, w, n, 0),
+                    hv(2, w, nw, 0),
+                    hv(3, n, ne, 0),
+                    hv(4, cb, w - bw, 0),
+                    hv(5, cb, n - bn, 0),
+                    hv(6, cb, c0v, 0),
+                    hv(7, w + n - nw, 0, 0),
+                    hv(8, m, gap, 0),
+                    hv(9, cb + w - bw, cb + n - bn, 0),
+                    hv(10, r(main), 0, 0),
+                    hv(11, w >> 2, n >> 2, (nw >> 2) << 8 | (ne >> 2) & 255),
+                    hv(12, r(main) >> 1, cb, 0),
+                    // paq8px's strongest: the previous bytes against a neighbour's
+                    hv(13, n, p1 - np1, p2 - np2),
+                    hv(14, w, p1 - wp1, p2 - wp2),
+                    hv(15, plane, p1, p2),
+                    hv(16, p1, p2, 0),
+                ];
+            }
             o.nv = NVMAX;
             for j in 0..NPI {
                 let e = ew[j].unsigned_abs() as u64 + en[j].unsigned_abs() as u64;
@@ -1078,6 +1111,10 @@ impl ImageModel {
     fn update(&mut self, x: i64, _r: i64) {
         let i = self.s % self.rowlen;
         let (px, c) = (i / self.comps, i % self.comps);
+        if self.palette {
+            let w = if px > 0 { self.px[self.slot(0, px - 1, c)] } else { -1 };
+            self.run = if w == x as i32 { self.run + 1 } else { 0 };
+        }
         let k = self.slot(0, px, c);
         self.px[k] = x as i32;
         let xf = x as f64;
@@ -1217,7 +1254,7 @@ impl SampleFront {
             }
         }
         let model = match lay.kind {
-            KIND_IMAGE => Model::Image(ImageModel::new(lay.row / lay.chans as usize, lay.chans as usize, bits)),
+            KIND_IMAGE => Model::Image(ImageModel::new(lay.row / lay.chans as usize, lay.chans as usize, bits, lay.flags & LAY_PALETTE != 0)),
             _ => Model::Audio(AudioModel::new(lay.chans as usize, bits)),
         };
         let mut f = Self {
