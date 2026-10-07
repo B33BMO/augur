@@ -404,7 +404,7 @@ fn png_expand(data: &[u8], virt: &mut Vec<u8>, lays: &mut Vec<Layout>) -> Option
                         count: w * h * chans,
                         width: (bit_depth / 8) as u8,
                         shift: 0,
-                        flags: front::LAY_BE,
+                        flags: front::LAY_BE | if chans >= 3 { front::LAY_GDIFF } else { 0 },
                         chans: chans as u8,
                         row: w * chans,
                         stride: rowbytes,

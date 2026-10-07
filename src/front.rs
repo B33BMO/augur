@@ -32,6 +32,10 @@ pub const LAY_SIGNED: u8 = 1; // samples are two's complement (else offset binar
 pub const LAY_BE: u8 = 2; // big-endian (AIFF)
 /// Samples are palette indices: equal means equal, but near means nothing.
 pub const LAY_PALETTE: u8 = 4;
+/// Colour samples are coded as G, R-G, B-G (mod 2^bits): green carries most
+/// of the luminance, and the differences are smooth chroma. Needs >= 3
+/// components with green second; alpha is left alone.
+pub const LAY_GDIFF: u8 = 8;
 
 /// Model selector stored in the container, so the decoder builds the same one.
 pub const KIND_AUDIO: u8 = 1;
@@ -92,9 +96,9 @@ impl Layout {
             .filter(|g| !g.is_empty())
     }
 
-    /// Sample `s` as a signed value with the wasted bits removed.
+    /// Raw unsigned value of the sample stored at `pos(s)`.
     #[inline]
-    pub fn read(&self, d: &[u8], s: usize) -> i64 {
+    fn raw(&self, d: &[u8], s: usize) -> u32 {
         let w = self.width as usize;
         let p = self.pos(s);
         let mut v: u32 = 0;
@@ -102,7 +106,52 @@ impl Layout {
             let b = if self.flags & LAY_BE != 0 { d[p + i] } else { d[p + w - 1 - i] };
             v = (v << 8) | b as u32;
         }
+        v
+    }
+
+    #[inline]
+    fn put_raw(&self, d: &mut [u8], s: usize, v: u32) {
+        let w = self.width as usize;
+        let p = self.pos(s);
+        for i in 0..w {
+            let b = (v >> (8 * i)) as u8;
+            if self.flags & LAY_BE != 0 {
+                d[p + w - 1 - i] = b;
+            } else {
+                d[p + i] = b;
+            }
+        }
+    }
+
+    /// For the colour transform: (stored sample of coded sample s, and the
+    /// green it is taken relative to, if any).
+    #[inline]
+    fn gdiff_map(&self, s: usize) -> (usize, Option<usize>) {
+        let ch = self.chans as usize;
+        let (px, c) = (s / ch * ch, s % ch);
+        match c {
+            0 => (px + 1, None),          // green first
+            1 => (px, Some(px + 1)),      // red - green
+            2 => (px + 2, Some(px + 1)),  // blue - green
+            _ => (px + c, None),          // alpha
+        }
+    }
+
+    /// Sample `s` (in coded order) as a signed value with the wasted bits removed.
+    #[inline]
+    pub fn read(&self, d: &[u8], s: usize) -> i64 {
+        let w = self.width as usize;
         let bits = 8 * w as u32;
+        let mut v = if self.flags & LAY_GDIFF != 0 {
+            let (at, g) = self.gdiff_map(s);
+            let v = self.raw(d, at);
+            match g {
+                Some(g) => v.wrapping_sub(self.raw(d, g)) & ((1u64 << bits) - 1) as u32,
+                None => v,
+            }
+        } else {
+            self.raw(d, s)
+        };
         if self.flags & LAY_SIGNED == 0 {
             v ^= 1 << (bits - 1);
         }
@@ -111,21 +160,24 @@ impl Layout {
     }
 
     #[inline]
+    /// Store coded sample `s`. With the colour transform, green must already
+    /// be stored — it is, because samples are written in coded order.
     pub fn write(&self, d: &mut [u8], s: usize, x: i64) {
         let w = self.width as usize;
-        let p = self.pos(s);
         let bits = 8 * w as u32;
-        let mut v = ((x << self.shift) as u64 & ((1u64 << bits) - 1)) as u32;
+        let mask = ((1u64 << bits) - 1) as u32;
+        let mut v = ((x << self.shift) as u64 & mask as u64) as u32;
         if self.flags & LAY_SIGNED == 0 {
             v ^= 1 << (bits - 1);
         }
-        for i in 0..w {
-            let b = (v >> (8 * i)) as u8;
-            if self.flags & LAY_BE != 0 {
-                d[p + w - 1 - i] = b;
-            } else {
-                d[p + i] = b;
+        if self.flags & LAY_GDIFF != 0 {
+            let (at, g) = self.gdiff_map(s);
+            if let Some(g) = g {
+                v = v.wrapping_add(self.raw(d, g)) & mask;
             }
+            self.put_raw(d, at, v);
+        } else {
+            self.put_raw(d, s, v);
         }
     }
 
@@ -191,6 +243,7 @@ impl Layout {
             _ => false,
         };
         let ok = shape_ok
+            && (l.flags & LAY_GDIFF == 0 || (l.kind == KIND_IMAGE && l.chans >= 3))
             && (1..=4).contains(&l.width)
             && (l.shift as u32) < l.width as u32 * 8
             && (1..=8).contains(&l.chans)

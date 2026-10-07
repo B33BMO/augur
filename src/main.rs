@@ -239,7 +239,7 @@ const LR: i32 = 15; // mixer learning rate (retuned for the two-layer mixer)
 const LR_SAMPLES: i32 = 8; // inside audio and image regions
 const APM_RATE: i32 = 8; // SSE adaptation shift
 const APM_EDGE: i32 = 1; // closest an SSE cell may get to certainty, in 1/65536
-const NMIX: usize = 5; // layer-1 mixers, one per selector view
+const NMIX: usize = 12; // layer-1 mixers, one per selector view
 /// log2(weight sets) for each layer-1 mixer: partial byte, previous byte,
 /// match-state x bit position, structure context.
 /// Mixer 2's selector packs a 4-bit match-length bucket, three oracle on-flags
@@ -248,7 +248,7 @@ const NMIX: usize = 5; // layer-1 mixers, one per selector view
 /// trust the match model is almost entirely a question of how long the match is.
 /// Mixer 4 is keyed on the effective order (how many byte orders have seen this
 /// context before), plus word and structure hits and the bit position.
-const MIX_CTX_BITS: [usize; NMIX] = [10, 8, 10, 8, 9];
+const MIX_CTX_BITS: [usize; NMIX] = [10, 8, 10, 8, 9, 12, 12, 10, 12, 10, 12, 14];
 const ARRAY_TAG: u32 = 0xA22A_5151;
 const NUMSLOTS: usize = 1 << 16;
 const REC_MAXLEN: u32 = 8192; // longest value the record model will remember
@@ -1774,6 +1774,24 @@ impl Predictor {
                 let strc = (self.seen >> (STR0 + 2) & 1) as usize;
                 (eff << 5) | (word << 4) | (strc << 3) | self.bitpos as usize
             },
+            // order 2: the last two bytes, hashed down
+            {
+                let n = self.buf.len();
+                let c2 = if n >= 2 { self.buf[n - 2] as u32 } else { 0 };
+                ((last | c2 << 8).wrapping_mul(0x9e37_79b1) >> 20) as usize
+            },
+            // the word being typed
+            (self.word_hash.wrapping_mul(0x85eb_ca6b) >> 20) as usize,
+            // the partial byte with the class of the last one
+            (self.c0 as usize) | ((self.shape & 3) as usize) << 8,
+            // the word and the one before it
+            ((self.word_hash ^ self.prev_word.wrapping_mul(0x2545_f491)).wrapping_mul(0x9e37_79b1) >> 20) as usize,
+            // where in the text: word/sentence/capital state, recent classes
+            self.text.mixer_sel(self.bitpos),
+            // how long the match is, with the partial byte
+            (lenbucket(m0.len) as usize) << 8 | self.c0 as usize,
+            // order 1 with the partial byte: the classic paq selector
+            (last as usize) << 6 ^ (self.c0 as usize),
         ]
     }
 
@@ -2790,7 +2808,7 @@ fn image_layout(d: &[u8], off: usize, w: usize, h: usize, comps: usize, width: u
         count: h * row,
         width: width as u8,
         shift: 0,
-        flags: if be { front::LAY_BE } else { 0 },
+        flags: if be { front::LAY_BE } else { 0 } | if comps >= 3 { front::LAY_GDIFF } else { 0 },
         chans: comps as u8,
         row,
         stride,
