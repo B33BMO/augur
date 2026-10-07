@@ -1,170 +1,276 @@
-//! Text model: words, the gaps between them, and the shape of the page.
+//! Text model: words, the tokens between them, and the shape of the page.
 //!
-//! The main predictor's word contexts see the word being typed and the one or
-//! two before it. Prose has far more structure than that: the punctuation and
-//! spacing between words ("gap tokens") predict the next word's case and kind;
-//! a word two or three back predicts this one even with a different word in
-//! between; brackets and quotes open regions with their own vocabulary; a
-//! column of a table or an indented block repeats what was above it; and a
-//! paragraph tends to keep using the characters it started with. Each of
-//! these is a context here, looked up per bit through a context bank.
+//! The order-n contexts see bytes; prose is made of words. This model follows
+//! the text as words and gap tokens (the punctuation and spacing between
+//! words), and hands the main predictor a set of contexts built from them —
+//! which flow through the same checksummed slots, bit histories and byte
+//! histories as the order-n contexts. Measured on paq8px, this kind of word
+//! modelling is worth 7% on prose by itself; its ideas are followed here:
+//!
+//! - word history shifts on punctuation too, so "word, word" and "word word"
+//!   are different contexts, and sentence ends clear it;
+//! - the last five letters or digits, ignoring everything else;
+//! - how long ago the current word last appeared;
+//! - sections introduced by "keyword:" or "keyword=";
+//! - expressions (letters separated by single spaces), word morphology
+//!   (vowel/consonant types of the last letters), character groups;
+//! - line structure: column, the character above, paragraph and line starts.
 
-use super::ctxbank::CtxBank;
+/// Contexts this model contributes to the main predictor's slots.
+pub const NTXT: usize = 32;
 
-const NT: usize = 24;
-pub const TEXT_IN: usize = 2 * NT;
-const TABLE_BITS: u32 = 22;
+const WPOS_BITS: u32 = 20;
+const BUF: usize = 1 << 16;
 
 #[inline]
-fn hstep(h: u32, c: u32) -> u32 {
-    (h ^ c).wrapping_mul(0x0100_0193).rotate_left(5)
+fn comb(h: u64, c: u64) -> u64 {
+    (h.wrapping_add(c + 1)).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23)
+}
+
+#[inline]
+fn hh(tag: u64, xs: &[u64]) -> u32 {
+    let mut h = tag.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    for &x in xs {
+        h = (h ^ x).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
+    }
+    (h >> 32) as u32 ^ h as u32
 }
 
 pub struct TextModel {
     c4: u32,
-    word: [u32; 5],    // current word, then the four before it
-    gap: [u32; 2],     // the token between words: now, and before the last word
-    in_word: bool,
-    letters: u32,      // hash of the last letters, ignoring everything else
-    letter_ring: [u8; 6],
-    mask: u32,         // 2-bit character classes, newest lowest
-    brackets: [u8; 16],
-    depth: usize,
+    c: u8,  // last byte, lower-cased
+    pc: u8, // the one before
+    is_letter: bool,
+    pc_letter: bool,
+    ppc_letter: bool,
+    newline: bool,
+    pc_newline: bool,
+    word: [u64; 5],
+    word_len: u32,
+    gap: [u64; 2],
+    text0: u64, // last five letters/digits
+    keyword: u64,
+    first_word: u64,
+    expr: [u64; 5],
+    expr_len: u32,
+    expr_chars: u32,
+    mask2: u32, // types of the last letters: vowel, e, consonant, th, digit, punctuation
+    groups: u64,
+    opened: u8,
+    last_upper: u32,
+    // word recency
+    wpos: Vec<u32>,
+    wchk: Vec<u16>,
+    // lines
     col: u32,
     line_start: usize,
     prev_line: usize,
     prev_len: u32,
-    para_first: u32,   // first byte and first word of this paragraph
-    para_word: u32,
-    blank_run: u32,    // consecutive newlines
-    sentence_start: bool,
-    cap: u32,          // capitalisation of the current word: 0 none, 1 first, 2 all so far
-    digits: u32,
-    buf: Vec<u8>,      // recent bytes, for the line above
-    texty: u32,        // decayed count of text-like bytes, x256
+    first_char: u32,
+    para_start: usize,
+    buf: Vec<u8>,
+    texty: u32,
     pub on: bool,
-    bank: CtxBank,
+    pub ctx: [u32; NTXT],
 }
 
 /// Fraction of text-like bytes (of a ~512-byte window) needed: 97%.
 const TEXTY_MIN: u32 = 512 * 256 * 97 / 100;
-const BUF: usize = 1 << 16;
 
 impl TextModel {
     pub fn new() -> Self {
         Self {
             c4: 0,
+            c: 0,
+            pc: 0,
+            is_letter: false,
+            pc_letter: false,
+            ppc_letter: false,
+            newline: false,
+            pc_newline: false,
             word: [0; 5],
+            word_len: 0,
             gap: [0; 2],
-            in_word: false,
-            letters: 0,
-            letter_ring: [0; 6],
-            mask: 0,
-            brackets: [0; 16],
-            depth: 0,
+            text0: 0,
+            keyword: 0,
+            first_word: 0,
+            expr: [0; 5],
+            expr_len: 0,
+            expr_chars: 0,
+            mask2: 0,
+            groups: 0,
+            opened: 0,
+            last_upper: 64,
+            wpos: vec![0; 1 << WPOS_BITS],
+            wchk: vec![0; 1 << WPOS_BITS],
             col: 0,
             line_start: 0,
             prev_line: 0,
             prev_len: 0,
-            para_first: 0,
-            para_word: 0,
-            blank_run: 0,
-            sentence_start: true,
-            cap: 0,
-            digits: 0,
+            first_char: 0,
+            para_start: 0,
             buf: vec![0; BUF],
             texty: 0,
             on: false,
-            bank: CtxBank::new(NT, TABLE_BITS),
+            ctx: [0; NTXT],
         }
     }
 
-    /// Advance past byte `b`, at stream position `pos` (the count of bytes before it).
+    fn wslot(h: u64) -> (usize, u16) {
+        ((h >> (64 - WPOS_BITS)) as usize, (h >> 8) as u16 | 1)
+    }
+
+    /// Advance past byte `b`, which sits at stream position `pos`.
     pub fn byte(&mut self, b: u8, pos: usize) {
         self.buf[pos & (BUF - 1)] = b;
         let textlike = matches!(b, b'\t' | b'\n' | b'\r' | 0x20..=0x7e | 0x80..=0xff);
         self.texty = self.texty - (self.texty >> 9) + if textlike { 256 } else { 0 };
         self.on = self.texty >= TEXTY_MIN;
+
+        self.ppc_letter = self.pc_letter;
+        self.pc_letter = self.is_letter;
+        self.pc_newline = self.newline;
+        let ppc = self.pc;
+        self.pc = self.c;
         self.c4 = self.c4 << 8 | b as u32;
-        let lower = b.to_ascii_lowercase();
-        let is_alnum = b.is_ascii_alphanumeric() || b >= 0x80;
-        let class = if b.is_ascii_alphabetic() || b >= 0x80 {
-            0
-        } else if b.is_ascii_digit() {
-            1
-        } else if b == b' ' || b == b'\n' || b == b'\t' || b == b'\r' {
-            2
-        } else {
-            3
-        };
-        self.mask = self.mask << 2 | class;
-        if is_alnum {
-            if !self.in_word {
-                // a word begins: the gap that preceded it is complete
+        let mut c = b;
+        if b.is_ascii_uppercase() {
+            c = b.to_ascii_lowercase();
+            self.last_upper = 0;
+        }
+        self.c = c;
+        self.last_upper = (self.last_upper + 1).min(64);
+        self.is_letter = c.is_ascii_lowercase() || b >= 0x80;
+        let is_number = c.is_ascii_digit() || (self.pc.is_ascii_digit() && c == b'.');
+        self.newline = b == b'\n';
+        self.mask2 <<= 8;
+
+        if self.is_letter || is_number {
+            if self.word_len == 0 {
+                // a word starts: the gap before it is complete
                 self.gap[1] = self.gap[0];
-                self.cap = if b.is_ascii_uppercase() { 1 } else { 0 };
-            } else if self.cap > 0 && !b.is_ascii_uppercase() {
-                self.cap = 1;
-            } else if self.cap == 1 && b.is_ascii_uppercase() && self.word[0] != 0 {
-                self.cap = 2;
+                if self.pc == b'"' || (self.pc == b'\'' && !self.ppc_letter) {
+                    self.opened = self.pc;
+                }
+                self.gap[0] = 0;
+                self.mask2 = 0;
             }
-            self.word[0] = hstep(self.word[0], lower as u32);
-            self.in_word = true;
-            if b.is_ascii_alphabetic() || b >= 0x80 {
-                self.letter_ring.rotate_right(1);
-                self.letter_ring[0] = lower;
-                self.letters = self.letter_ring.iter().fold(0, |h, &c| hstep(h, c as u32));
+            self.word[0] = comb(self.word[0], c as u64);
+            self.text0 = (self.text0 << 8 | c as u64) & 0xff_ffff_ffff;
+            self.word_len = (self.word_len + 1).min(45);
+            if self.is_letter {
+                self.mask2 |= match c {
+                    b'e' => b'e' as u32,
+                    b'a' | b'i' | b'o' | b'u' => b'a' as u32,
+                    b'y' => b'y' as u32,
+                    b'h' if self.pc == b't' => {
+                        self.mask2 = (self.mask2 >> 8) & 0x00ff_ff00;
+                        b't' as u32
+                    }
+                    b'b'..=b'z' => b'b' as u32,
+                    _ => 128,
+                };
+            } else {
+                self.mask2 |= match c {
+                    b'.' => b'.' as u32,
+                    b'0' => b'0' as u32,
+                    _ => b'1' as u32,
+                };
             }
-            self.digits = if b.is_ascii_digit() { self.digits + 1 } else { 0 };
         } else {
-            if self.in_word {
-                // a word ends
+            self.gap[0] = comb(self.gap[0], if self.newline { b' ' as u64 } else { b as u64 });
+            if c == b'?' || self.pc == b'!' || self.pc == b'.' {
+                // a sentence ends: what came before says little now
+                self.word[1..].fill(0);
+                self.gap[1] = 0;
+            } else if c == self.pc || ((c == b' ' || self.newline) && (self.pc == b' ' || self.pc_newline)) {
+                // repeats and runs of whitespace don't shift the words
+            } else {
                 for k in (1..5).rev() {
                     self.word[k] = self.word[k - 1];
                 }
-                if self.para_word == 0 {
-                    self.para_word = self.word[1];
+            }
+            if self.word_len != 0 {
+                // the word just ended: note where, for "how long since"
+                let (s, chk) = Self::wslot(self.word[0]);
+                self.wpos[s] = pos as u32;
+                self.wchk[s] = chk;
+                if c == b':' || c == b'=' {
+                    self.keyword = self.word[0];
+                }
+                if self.first_word == 0 {
+                    self.first_word = self.word[0];
                 }
                 self.word[0] = 0;
-                self.gap[0] = 0;
-                self.in_word = false;
+                self.word_len = 0;
+                self.mask2 = 0;
             }
-            self.gap[0] = hstep(self.gap[0], b as u32);
-            self.digits = 0;
-        }
-        match b {
-            b'.' | b'!' | b'?' => self.sentence_start = true,
-            _ if is_alnum => self.sentence_start = false,
-            _ => {}
-        }
-        match b {
-            b'(' | b'[' | b'{' | b'<' => {
-                if self.depth < 16 {
-                    self.brackets[self.depth] = b;
+            self.mask2 |= match b {
+                b'.' | b'!' | b'?' => b'!' as u32,
+                b',' | b';' | b':' => b',' as u32,
+                b'(' | b'{' | b'[' | b'<' => {
+                    self.opened = b;
+                    b'(' as u32
                 }
-                self.depth += 1;
-            }
-            b')' | b']' | b'}' | b'>' => self.depth = self.depth.saturating_sub(1),
-            _ => {}
+                b')' | b'}' | b']' | b'>' => {
+                    self.opened = 0;
+                    b')' as u32
+                }
+                b'"' | b'\'' => {
+                    self.opened = 0;
+                    b as u32
+                }
+                _ => b as u32,
+            };
         }
-        if b == b'\n' {
-            self.blank_run += 1;
-            if self.blank_run >= 2 {
-                self.para_first = 0;
-                self.para_word = 0;
+        let g = match b {
+            0x80..=0xff => match b {
+                _ if b & 0xf8 == 0xf0 => 1,
+                _ if b & 0xf0 == 0xe0 => 2,
+                _ if b & 0xe0 == 0xc0 => 3,
+                _ if b & 0xc0 == 0x80 => 4,
+                _ => b & 0xf0,
+            },
+            b'0'..=b'9' => b'0',
+            b'a'..=b'z' => b'a',
+            b'A'..=b'Z' => b'A',
+            0..=31 if !self.newline => 6,
+            _ => b,
+        };
+        self.groups = self.groups << 8 | g as u64;
+        // expressions: letters separated by single spaces
+        if self.is_letter {
+            self.expr_chars = self.expr_chars << 8 | c as u32;
+            self.expr[0] = comb(self.expr[0], c as u64);
+            self.expr_len = (self.expr_len + 1).min(45);
+        } else {
+            self.expr_chars = 0;
+            self.expr_len = 0;
+            if (c == b' ' || self.newline) && (self.pc_letter || self.pc == b'\'' || self.pc == b'"') {
+                for k in (1..5).rev() {
+                    self.expr[k] = self.expr[k - 1];
+                }
+                self.expr[0] = 0;
+            } else if c == b'\'' || c == b'"' || (self.newline && self.pc == b' ') || (c == b' ' && self.pc_newline) {
+            } else {
+                self.expr = [0; 5];
+            }
+        }
+        let _ = ppc;
+        // lines and paragraphs
+        if self.newline {
+            if pos + 1 - self.line_start <= 1 {
+                self.para_start = pos + 1; // a blank line
+                self.first_word = 0;
             }
             self.prev_len = self.col;
             self.prev_line = self.line_start;
             self.line_start = pos + 1;
             self.col = 0;
+            self.first_char = 0;
         } else {
-            if self.blank_run >= 2 || self.para_first == 0 {
-                if self.para_first == 0 && b != b' ' && b != b'\r' {
-                    self.para_first = b as u32 | 0x100;
-                }
-            }
-            if b != b'\r' {
-                self.blank_run = 0;
+            if self.col == 0 {
+                self.first_char = b as u32 | 0x100;
             }
             self.col += 1;
         }
@@ -172,64 +278,61 @@ impl TextModel {
     }
 
     fn contexts(&mut self, next_pos: usize) {
-        let c1 = self.c4 & 0xff;
-        let [w0, w1, w2, w3, _] = self.word;
+        let c = self.c as u64;
+        let c1 = (self.c4 & 0xff) as u64;
+        let [w0, w1, w2, w3, w4] = self.word;
         let [g0, g1] = self.gap;
-        let col = self.col.min(255);
-        // the byte at this column in the line above, if the line was long enough
-        let above = if self.col < self.prev_len && next_pos - self.prev_line < BUF {
-            self.buf[(self.prev_line + self.col as usize) & (BUF - 1)] as u32
-        } else {
-            0x100
-        };
-        let above2 = if self.col + 1 < self.prev_len { self.buf[(self.prev_line + self.col as usize + 1) & (BUF - 1)] as u32 } else { 0x100 };
-        let open = if self.depth > 0 { self.brackets[(self.depth - 1).min(15)] as u32 } else { 0 };
-        let h = |tag: u32, a: u32, b: u32, c: u32| {
-            tag.wrapping_mul(0x9e37_79b1) ^ a.wrapping_mul(0x85eb_ca6b) ^ b.wrapping_mul(0xc2b2_ae35) ^ c.wrapping_mul(0x27d4_eb2f)
-        };
-        let state = self.sentence_start as u32 | self.cap << 1 | (self.in_word as u32) << 3;
-        let base = [
-            h(1, w0, g0, 0),
-            h(2, c1, w0, g1),
-            h(3, c1, g0, w1),
-            h(4, w0, w1, 0),
-            h(5, w0, w1, w2),
-            h(6, g0, w1, g1 ^ w2.rotate_left(7)),
-            h(7, w0, c1, w2),
-            h(8, w0, c1, w3),
-            h(9, open, w0, self.depth.min(7) as u32),
-            h(10, open, c1, self.depth.min(7) as u32),
-            h(11, col << 8 | c1, 0, 0),
-            h(12, above, c1, col.min(31)),
-            h(13, above, above2, c1),
-            h(14, self.para_first, c1, 0),
-            h(15, self.para_word, w0, 0),
-            h(16, self.mask & 0xffff, 0, 0),
-            h(17, self.mask & 0xff, c1, 0),
-            h(18, self.letters, 0, 0),
-            h(19, state, w0, c1),
-            h(20, state, w1, g0),
-            h(21, w0, self.prev_len.min(127), col.min(15)),
-            h(22, w2, w0, g0),
-            h(23, self.c4 & 0xffff, w0, 0),
-            h(24, self.digits.min(15), c1, self.c4 >> 8 & 0xff),
+        let (s, chk) = Self::wslot(w0);
+        let last = if self.wchk[s] == chk { self.wpos[s] } else { 0 };
+        let dist = if last == 0 { 0 } else { (64 - ((next_pos as u64 - last as u64 + 120).leading_zeros() as u64)).min(20) };
+        let may_end = (last != 0) as u64;
+        let caps = ((self.c4 >> 8 & 0xff) as u8).is_ascii_uppercase() && (self.c4 as u8).is_ascii_uppercase();
+        let wme = may_end << 1 | caps as u64;
+        let wl = (self.word_len as u64).min(6) << 2 | wme;
+        let col = self.col.min(255) as u64;
+        let above = if (self.col) < self.prev_len { self.buf[(self.prev_line + self.col as usize) & (BUF - 1)] as u64 } else { 0x100 };
+        let above2 = if self.col + 1 < self.prev_len { self.buf[(self.prev_line + self.col as usize + 1) & (BUF - 1)] as u64 } else { 0x100 };
+        let el = self.expr_len as u64;
+        let ec = self.expr_chars as u64;
+        self.ctx = [
+            hh(1, &[self.text0]),
+            hh(2, &[self.expr[0], self.expr[1], self.expr[2], self.expr[3], self.expr[4]]),
+            hh(3, &[self.expr[0], self.expr[1], self.expr[2]]),
+            hh(4, &[g0, self.keyword]),
+            hh(5, &[w0, c, self.keyword]),
+            hh(6, &[w0, dist]),
+            hh(7, &[w1, g0, dist]),
+            hh(8, &[(next_pos >> 10) as u64, w0]),
+            hh(9, &[wl, self.mask2 as u64]),
+            hh(10, &[el.min(4) << 2 | wme, if el >= 2 { ec & 0xffff } else { c }]),
+            hh(11, &[el.min(6) << 2 | wme, if el >= 3 { ec & 0xff_ffff } else { 0 }]),
+            hh(12, &[w0, g0]),
+            hh(13, &[c, w0, g1]),
+            hh(14, &[c, g0, w1]),
+            hh(15, &[w0, w1]),
+            hh(16, &[w0, w1, w2]),
+            hh(17, &[g0, w1, g1, w2]),
+            hh(18, &[w0, w1, g1, w2]),
+            hh(19, &[w0, w1, g1]),
+            hh(20, &[w0, c1, w2]),
+            hh(21, &[w0, c1, w3]),
+            hh(22, &[w0, c1, w1, w4]),
+            hh(23, &[self.opened as u64, wl, (dist != 0) as u64]),
+            hh(24, &[self.opened as u64, w0]),
+            hh(25, &[self.groups & 0xffff_ffff]),
+            hh(26, &[self.groups & 0xff_ffff, c]),
+            hh(27, &[col << 8 | c1, (self.c4 >> 8 & 0xff) as u64]),
+            hh(28, &[above, above2, c1]),
+            hh(29, &[col, self.prev_len.min(255) as u64, above]),
+            hh(30, &[(self.para_start as u64) << 8 | c1]),
+            hh(31, &[self.first_word, c]),
+            hh(32, &[col << 8 | self.first_char as u64, (self.last_upper < self.col) as u64, self.groups & 0xff]),
         ];
-        self.bank.base.copy_from_slice(&base);
     }
 
     /// Mixer selector: where in the text we are.
     pub fn mixer_sel(&self, bitpos: u32) -> usize {
-        let state = self.sentence_start as u32 | self.cap << 1 | (self.in_word as u32) << 3;
-        ((state << 4 | (self.mask & 15)) << 3 | bitpos) as usize
-    }
-
-    #[inline]
-    pub fn inputs(&mut self, c0: u32, st: &mut [i32]) {
-        self.bank.inputs(c0, st);
-    }
-
-    #[inline]
-    pub fn update(&mut self, bit: u32) {
-        self.bank.update(bit);
+        let state = (self.word_len > 0) as u32 | ((self.last_upper < 2) as u32) << 1 | ((self.mask2 & 0xff) == b'!' as u32) as u32 * 4;
+        ((state << 5 | (self.groups & 0x1f) as u32) << 3 | bitpos) as usize & 0x1ff
     }
 }

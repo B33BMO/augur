@@ -202,7 +202,9 @@ const MEM_BITS_MAX: usize = 23;
 /// bytes each: 512 MB at the largest size. Sharing lets memory flow to the
 /// contexts that need it — order 1 has a few thousand contexts and order 24 has
 /// millions, so equal per-model tables starve one and waste the other.
-const POOL_DELTA: usize = 0;
+const POOL_DELTA: usize = 1;
+/// Slots per hash bucket: a context may live in any of them.
+const WAYS: usize = 4;
 
 fn mem_bits_for(len: usize) -> usize {
     let bl = usize::BITS - len.max(1).leading_zeros(); // ceil-ish log2
@@ -219,10 +221,13 @@ const NBIN: usize = 4; // 2 record-stride + 2 sparse contexts
 const NCOL: usize = 2; // text column: the byte above in the previous line
 const NIND: usize = 2; // indirect: what followed this byte / byte pair last time
 const NSHAPE: usize = 3; // byte-class shape of the recent past: short, long, and fine-grained
-const NTAB: usize = NORD + NWORD + NSTR + NBIN + NCOL + NIND + NSHAPE;
+const NTXT: usize = text::NTXT; // the text model's word, gap and line contexts
+const NTAB: usize = NORD + NWORD + NSTR + NBIN + NCOL + NIND + NSHAPE + NTXT;
 const WORD0: usize = NORD; // first word-model slot in ctxh
 const STR0: usize = NORD + NWORD; // first structure-model slot in ctxh
 const BIN0: usize = STR0 + NSTR; // first binary/record-stride slot in ctxh
+/// Text contexts come last, so outside text the slot loops simply stop short.
+const TXT0: usize = NTAB - NTXT;
 const COL0: usize = BIN0 + NBIN; // first text-column slot in ctxh
 const IND0: usize = COL0 + NCOL; // first indirect slot in ctxh
 const SHAPE0: usize = IND0 + NIND;
@@ -230,7 +235,10 @@ const NMATCH: usize = 2; // match models: short-context (fast reacquire) + long 
 const NREC: usize = 1; // record-history model
 const NRUN: usize = 1; // run map: the highest order whose context keeps repeating one byte
 const ORA0: usize = 3 * NTAB; // first oracle input: each context feeds a counter and a bit history
-const FRONT0: usize = ORA0 + NMATCH + NREC + NRUN + 1; // first sample front-end input
+/// Byte-history inputs: per context, the byte it saw last, trusted by how
+/// often in a row it has seen it.
+const BH0: usize = ORA0 + NMATCH + NREC + NRUN + 1;
+const FRONT0: usize = BH0 + NTAB; // first sample front-end input
 const NIN: usize = FRONT0 + FRONT_IN; // contexts + match + record + run + numeric + front-end
 const MINLEN: usize = 6;
 const MINLEN_LONG: usize = 16;
@@ -240,6 +248,12 @@ const LR_SAMPLES: i32 = 8; // inside audio and image regions
 const APM_RATE: i32 = 8; // SSE adaptation shift
 const APM_EDGE: i32 = 1; // closest an SSE cell may get to certainty, in 1/65536
 const NMIX: usize = 12; // layer-1 mixers, one per selector view
+/// Middle layer: remixes the layer-1 outputs and a few promoted inputs.
+const NMID: usize = 4;
+const NPROMO: usize = 3; // the two match models and the record model
+const MID_IN: usize = NMIX + NPROMO;
+/// The combining layer sees the middle layer and, skipping it, layer 1.
+const FIN_IN: usize = NMID + NMIX;
 /// log2(weight sets) for each layer-1 mixer: partial byte, previous byte,
 /// match-state x bit position, structure context.
 /// Mixer 2's selector packs a 4-bit match-length bucket, three oracle on-flags
@@ -1107,12 +1121,17 @@ struct Predictor {
     slot_bits: usize,
     cur: [usize; NTAB], // slot each model is reading for the current nibble
     node: usize,        // node of the nibble tree for the current bit (0..15)
-    seen: u32,          // bit m set: model m's slot already existed (not freshly claimed)
+    seen: u64,          // bit m set: model m's slot already existed (not freshly claimed)
+    tl: usize,          // context models live: all of them in text, the rest elsewhere
     cur0: [usize; NTAB], // byte-start slot per model, where its run map lives
     chk0: [u16; NTAB],
     run_byte: u8,
     run_cx: u32, // (order rank, run length bucket), or u32::MAX when no run applies
     trust_run: TrustMap,
+    bh_byte: [u8; NTAB],   // per context: the byte it last saw (at this byte's start)
+    bh_run: [u8; NTAB],    // and how many times in a row; 0 = none
+    bh_tab: Vec<u32>,      // (model, run, bit position, expected bit) -> P(right)
+    bh_idx: [u32; NTAB],   // cell used this bit, u32::MAX if idle
     sm: Vec<u32>,       // StateMaps: NTAB rows of 256
     stt: &'static StateTab,
     // SSE stages, applied to the mixer output in sequence
@@ -1220,6 +1239,13 @@ struct Predictor {
     mix1: Vec<Mixer<NIN>>,
     mix2: Mixer<NMIX>,
     m1out: [i32; NMIX],
+    mixm: Vec<Mixer<MID_IN>>,
+    mid_in: [i32; MID_IN],
+    mid_out: [i32; NMID],
+    mixf: Mixer<FIN_IN>,
+    fin_in: [i32; FIN_IN],
+    three: bool,
+    bits_seen: u64,
     // cached for update()
     st: [i32; NIN],
     mix2out: i32, // layer-2 stretched output — what the SSE chain refines
@@ -1234,11 +1260,16 @@ impl Predictor {
             cur: [0; NTAB],
             node: 0,
             seen: 0,
+            tl: TXT0,
             cur0: [0; NTAB],
             chk0: [0; NTAB],
             run_byte: 0,
             run_cx: u32::MAX,
             trust_run: TrustMap::with_size(1 << 12),
+            bh_byte: [0; NTAB],
+            bh_run: [0; NTAB],
+            bh_tab: vec![TRUST_INIT; NTAB * 16 * 8 * 2],
+            bh_idx: [u32::MAX; NTAB],
             sm: (0..NTAB).flat_map(|_| sm_init(state_tab())).collect(),
             stt: state_tab(),
             apm_c0: Apm::new(8),
@@ -1335,6 +1366,13 @@ impl Predictor {
             mix1: MIX_CTX_BITS.iter().map(|&b| Mixer::new(b)).collect(),
             mix2: Mixer::new(8),
             m1out: [0; NMIX],
+            mixm: [8usize, 10, 10, 9].iter().map(|&b| Mixer::new(b)).collect(),
+            mid_in: [0; MID_IN],
+            mid_out: [0; NMID],
+            mixf: Mixer::new(8),
+            fin_in: [0; FIN_IN],
+            three: std::env::var_os("AUGUR_MIX3").is_some(),
+            bits_seen: 0,
             st: [0; NIN],
             mix2out: 0,
         };
@@ -1350,7 +1388,7 @@ impl Predictor {
             return; // already configured; re-selecting would mark fresh slots as seen
         }
         // undo the first nibble's claims so they are made under image contexts
-        for m in 0..NTAB {
+        for m in 0..self.tl {
             self.slots[self.cur[m]] = SLOT_EMPTY;
         }
         self.img = img;
@@ -1370,7 +1408,7 @@ impl Predictor {
         self.pending = regions;
         if self.attach_due() {
             // the next nibble's slots were claimed under the old contexts
-            for m in 0..NTAB {
+            for m in 0..self.tl {
                 self.slots[self.cur[m]] = SLOT_EMPTY;
             }
             self.recompute_ctx();
@@ -1549,6 +1587,9 @@ impl Predictor {
         if let Some(g) = self.img {
             self.image_ctx(g);
         }
+        if self.tl == NTAB {
+            self.ctxh[TXT0..].copy_from_slice(&self.text.ctx);
+        }
         if let Some(f) = self.front.as_deref().filter(|f| f.active()) {
             let mut c = [0u32; 8];
             if f.slot_ctx(&mut c) {
@@ -1590,7 +1631,12 @@ impl Predictor {
         }
         let stab = stretch_tab();
         let node = self.node;
-        for m in 0..NTAB {
+        for m in self.tl..NTAB {
+            self.st[m] = 0;
+            self.st[NTAB + m] = 0;
+            self.st[2 * NTAB + m] = 0;
+        }
+        for m in 0..self.tl {
             // SAFETY: cur[m] < slots.len() by construction in select_slots; node < 15
             let sl = unsafe { self.slots.get_unchecked(self.cur[m]) };
             let (cv, hs) = unsafe { (*sl.ctr.get_unchecked(node), *sl.st.get_unchecked(node)) };
@@ -1645,6 +1691,28 @@ impl Predictor {
             }
         };
 
+        // byte histories: each context's last byte, while it still fits the
+        // bits coded so far
+        {
+            let placed = self.c0 - (1 << self.bitpos);
+            for m in self.tl..NTAB {
+                self.bh_idx[m] = u32::MAX;
+                self.st[BH0 + m] = 0;
+            }
+            for m in 0..self.tl {
+                let (rb, rn) = (self.bh_byte[m] as u32, self.bh_run[m] as usize);
+                if rn > 0 && (self.bitpos == 0 || placed == rb >> (8 - self.bitpos)) {
+                    let eb = (rb >> (7 - self.bitpos)) & 1;
+                    let ix = ((m * 16 + rn.min(15)) * 8 + self.bitpos as usize) * 2 + eb as usize;
+                    self.bh_idx[m] = ix as u32;
+                    self.st[BH0 + m] = stab[wide_p12(self.bh_tab[ix])];
+                } else {
+                    self.bh_idx[m] = u32::MAX;
+                    self.st[BH0 + m] = 0;
+                }
+            }
+        }
+
         // run map: same oracle shape as the match model, one byte at a time
         self.st[ORA0 + NMATCH + NREC + 1] = {
             let placed = self.c0 - (1 << self.bitpos);
@@ -1670,9 +1738,6 @@ impl Predictor {
             if let Some(x) = self.x86.as_deref_mut().filter(|x| x.on) {
                 x.inputs(self.c0, &mut self.st[FRONT0..]);
                 self.live = FRONT0 + x86::X86_IN;
-            } else if self.text.on {
-                self.text.inputs(self.c0, &mut self.st[FRONT0..]);
-                self.live = FRONT0 + text::TEXT_IN;
             }
         }
         let in_samples = self.front.as_deref().is_some_and(|f| f.active() && f.sample_sels(0).is_some());
@@ -1681,8 +1746,18 @@ impl Predictor {
             // beat 4-24 fixed and every decay schedule tried)
             (LR_SAMPLES, LR_SAMPLES)
         } else {
-            (LR, LR)
+            // TUNING: decaying rate, knobs AUGUR_LRD="hi,lo,k(Kbits)"
+            match std::env::var("AUGUR_LRD").ok() {
+                Some(v) => {
+                    let k: Vec<i64> = v.split(',').map(|x| x.parse().unwrap()).collect();
+                    let t = self.bits_seen as i64;
+                    let lr = (k[1] + (k[0] - k[1]) * k[2] * 1000 / (k[2] * 1000 + t)) as i32;
+                    (lr, lr)
+                }
+                None => (LR, LR),
+            }
         };
+        self.bits_seen += 1;
         if let Some(f) = self.front.as_deref_mut() {
             if f.active() {
                 f.inputs(self.c0, self.bitpos, &mut self.st[FRONT0..]);
@@ -1715,7 +1790,27 @@ impl Predictor {
         for j in 0..NMIX {
             self.m1out[j] = self.mix1[j].mix(&self.st, sel[j], self.live);
         }
-        self.mix2out = self.mix2.mix(&self.m1out, self.c0 as usize, NMIX);
+        if self.three {
+            self.mid_in[..NMIX].copy_from_slice(&self.m1out);
+            self.mid_in[NMIX] = self.st[ORA0];
+            self.mid_in[NMIX + 1] = self.st[ORA0 + 1];
+            self.mid_in[NMIX + 2] = self.st[ORA0 + NMATCH];
+            let m0 = &self.matches[0];
+            let msel = [
+                self.c0 as usize,
+                (last as usize) << 2 | (self.bitpos as usize >> 1),
+                (lenbucket(m0.len) as usize) << 6 | (self.rec_on as usize) << 5 | (m0.on as usize) << 4 | (self.bitpos as usize),
+                self.text.mixer_sel(self.bitpos) & 511,
+            ];
+            for j in 0..NMID {
+                self.mid_out[j] = self.mixm[j].mix(&self.mid_in, msel[j], MID_IN);
+            }
+            self.fin_in[..NMID].copy_from_slice(&self.mid_out);
+            self.fin_in[NMID..].copy_from_slice(&self.m1out);
+            self.mix2out = self.mixf.mix(&self.fin_in, self.c0 as usize, FIN_IN);
+        } else {
+            self.mix2out = self.mix2.mix(&self.m1out, self.c0 as usize, NMIX);
+        }
 
         // SSE chain: three calibrations of the mixed output, each blended 3:1
         // with its input so a cold APM can only nudge, never hijack.
@@ -1786,8 +1881,14 @@ impl Predictor {
             (self.c0 as usize) | ((self.shape & 3) as usize) << 8,
             // the word and the one before it
             ((self.word_hash ^ self.prev_word.wrapping_mul(0x2545_f491)).wrapping_mul(0x9e37_79b1) >> 20) as usize,
-            // where in the text: word/sentence/capital state, recent classes
-            self.text.mixer_sel(self.bitpos),
+            // in text: how many of the word contexts have been seen before —
+            // how much the word statistics know here (paq8px's key selector)
+            if self.tl == NTAB {
+                let known = (self.seen >> TXT0).count_ones() as usize;
+                known << 3 | self.bitpos as usize
+            } else {
+                self.text.mixer_sel(self.bitpos)
+            },
             // how long the match is, with the partial byte
             (lenbucket(m0.len) as usize) << 8 | self.c0 as usize,
             // order 1 with the partial byte: the classic paq selector
@@ -1817,14 +1918,31 @@ impl Predictor {
         self.trust_rec.update(bit);
         self.trust_num.update(bit);
         self.trust_run.update(bit);
+        if !self.fast {
+            for m in 0..self.tl {
+                let ix = self.bh_idx[m];
+                if ix != u32::MAX {
+                    let c = &mut self.bh_tab[ix as usize];
+                    *c = wide_update(*c, bit);
+                }
+            }
+        }
         if let Some(f) = self.front.as_deref_mut().filter(|f| f.active()) {
             f.update(bit);
         }
         if let Some(x) = self.x86.as_deref_mut() {
             x.update(bit);
         }
-        self.text.update(bit);
-        self.mix2.update(&self.m1out, self.mix2out, bit, NMIX, self.lr2);
+
+        if self.three {
+            self.mixf.update(&self.fin_in, self.mix2out, bit, FIN_IN, self.lr2);
+            for j in 0..NMID {
+                let out = self.mid_out[j];
+                self.mixm[j].update(&self.mid_in, out, bit, MID_IN, self.lr2);
+            }
+        } else {
+            self.mix2.update(&self.m1out, self.mix2out, bit, NMIX, self.lr2);
+        }
         for j in 0..NMIX {
             let out = self.m1out[j];
             self.mix1[j].update(&self.st, out, bit, self.live, self.lr1);
@@ -1832,7 +1950,7 @@ impl Predictor {
         // context updates: the node's counter, its bit history, and the StateMap
         // cell that history was read through
         let node = self.node;
-        for m in 0..if self.fast { 0 } else { NTAB } {
+        for m in 0..if self.fast { 0 } else { self.tl } {
             let sl = unsafe { self.slots.get_unchecked_mut(self.cur[m]) };
             let c = unsafe { sl.ctr.get_unchecked_mut(node) };
             *c = ctr_update(*c, bit, CLIMIT);
@@ -1871,13 +1989,13 @@ impl Predictor {
         let h = slot_hash(self.ctxh[m], nib, m);
         // the model index is part of the hash, so models share the pool
         // without sharing contexts
-        let i = ((h >> (64 - self.slot_bits)) as usize) & !1;
+        let i = ((h >> (64 - self.slot_bits)) as usize) & !(WAYS - 1);
         (i, h as u16)
     }
 
     fn prefetch_slots(&self) {
         let base = self.slots.as_ptr();
-        for m in 0..NTAB {
+        for m in 0..self.tl {
             for y in 0..2 {
                 let (i, _) = self.slot_index(m, (self.c0 << 1) | y);
                 // SAFETY: i < slots.len(); a prefetch has no architectural effect
@@ -1895,33 +2013,37 @@ impl Predictor {
         // them, so the misses overlap instead of queueing behind each compare
         let mut at = [(0usize, 0u16); NTAB];
         let base = self.slots.as_ptr();
-        for m in 0..NTAB {
+        for m in 0..self.tl {
             at[m] = self.slot_index(m, nib);
             // SAFETY: index < slots.len(); a prefetch has no architectural effect
             unsafe { prefetch(base.add(at[m].0) as *const u16) };
         }
-        for m in 0..NTAB {
+        for m in 0..self.tl {
             let (i, chk) = at[m];
-            let pick = if self.slots[i].chk == chk {
-                self.seen |= 1 << m;
-                i
-            } else if self.slots[i + 1].chk == chk {
-                self.seen |= 1 << m;
-                i + 1
-            } else {
-                // evict whichever pair member has the thinner root history
-                let w = |sl: &Slot| self.stt.n0[sl.st[0] as usize] as u32 + self.stt.n1[sl.st[0] as usize] as u32;
-                let v = if w(&self.slots[i]) <= w(&self.slots[i + 1]) { i } else { i + 1 };
-                self.slots[v] = Slot { chk, ..SLOT_EMPTY };
-                v
+            let pick = match (0..WAYS).find(|&k| self.slots[i + k].chk == chk) {
+                Some(k) => {
+                    self.seen |= 1u64 << m;
+                    i + k
+                }
+                None => {
+                    // evict the bucket member with the thinnest root history
+                    let w = |sl: &Slot| self.stt.n0[sl.st[0] as usize] as u32 + self.stt.n1[sl.st[0] as usize] as u32;
+                    let v = (0..WAYS).map(|k| i + k).min_by_key(|&v| w(&self.slots[v])).unwrap();
+                    self.slots[v] = Slot { chk, ..SLOT_EMPTY };
+                    v
+                }
             };
             self.cur[m] = pick;
         }
         if self.bitpos == 0 {
             self.run_cx = u32::MAX;
-            for m in 0..NTAB {
+            for m in 0..self.tl {
                 self.cur0[m] = self.cur[m];
                 self.chk0[m] = self.slots[self.cur[m]].chk;
+                let sl = &self.slots[self.cur[m]];
+                let known = self.seen >> m & 1 == 1;
+                self.bh_byte[m] = sl.rb;
+                self.bh_run[m] = if known { sl.rn } else { 0 };
             }
             // the longest byte order still repeating itself speaks for the run map
             for r in (0..ORDERS.len()).rev() {
@@ -1938,7 +2060,7 @@ impl Predictor {
 
     /// Fold the byte just coded into every model's run map.
     fn update_runs(&mut self, byte: u8) {
-        for m in 0..NTAB {
+        for m in 0..self.tl {
             let sl = &mut self.slots[self.cur0[m]];
             if sl.chk != self.chk0[m] {
                 continue; // evicted by this byte's second-nibble lookup
@@ -2026,6 +2148,7 @@ impl Predictor {
             x.byte(byte);
         }
         self.text.byte(byte, self.buf.len() - 1);
+        self.tl = if self.text.on { NTAB } else { TXT0 };
         self.attach_due();
         self.recompute_ctx();
     }

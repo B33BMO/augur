@@ -174,7 +174,7 @@ The coded stream begins with the recipe (expansion tree and sample layouts), so 
 ## Honest caveats
 
 - **It is slow.** Generic data runs around 0.25 MB/s each way; audio, images and JPEG run at tens of KB/s, because every sample drives least-squares solves or every bit drives two dozen hashed lookups. Encode and decode cost about the same. This is a write-once, read-rarely compressor: archival, backups, cold storage.
-- **Memory is up to ~1 GB** for large inputs.
+- **Memory is up to ~1.3 GB** for large inputs.
 - **paq8px is stronger** on prose, source code and executables (10–38% on Silesia's text and binary files), colour photographs (~10%), JPEG (~3.5 points of saving), and some audio. augur is ahead of every *practical* codec measured, not of every research one.
 - **Not yet handled:** progressive JPEG (coded as ordinary bytes), MP3/AAC, FLAC, xz/bzip2/zstd payloads. These pass through the generic models and gain little.
 - **Containers from v0.1 and earlier versions cannot be decoded** by this release; the format changed twice (versions 4 and 5).
