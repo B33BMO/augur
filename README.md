@@ -20,7 +20,7 @@ Where it stands, plainly:
 
 - **Against `zpaq -m5`**, the strongest widely-packaged context mixer, it takes the Silesia corpus by **9.6%** and wins 11 of its 12 files; on deflate-packed files (PDFs, JARs, archives) it is **26–66%** smaller, because zpaq cannot see inside them.
 - **Against format specialists** it wins too: **8–31% smaller than `flac -8`** on audio, **~26% smaller than JPEG XL** (`cjxl -d 0 -e 9`) on photographic images, and **20%** off baseline JPEGs.
-- **Against paq8px**, the research-grade champion, it is mostly behind: within ~0.5% on most 16-bit audio (and far ahead on 24-bit, which paq8px does not model), ~3.5 points behind on JPEG, ~10% on colour photographs, and 10–38% on prose, source code and executables.
+- **Against paq8px**, the research-grade champion, it is mostly behind: within ~0.5% on most 16-bit audio (and far ahead on 24-bit, which paq8px does not model), ~3.5 points behind on JPEG, ~10% on colour photographs, and 10–35% on prose, source code and executables. paq8px also unpacks zlib streams, so on zlib-made containers (JARs, PDFs, DOCX) it is 30–35% smaller than augur; augur wins only where another encoder made the stream (GNU gzip: 2x smaller; Info-ZIP: 6% smaller), which paq8px cannot unpack.
 - It is **slow** — tens of KB/s on audio, images and JPEG. See the caveats.
 
 ## Results
@@ -63,6 +63,8 @@ The standard mixed corpus, 212 MB, whole files.
 | pride.epub (Gutenberg, JPEG-heavy) | 24,836,548 | 24,226,444 | 23,046,695 | **18,939,996** | **−17.8%** |
 
 GNU gzip, Info-ZIP and most PNG optimisers are *not* zlib, so no parameter search can reproduce their output — these go through reflate (below).
+
+paq8px -8 on the same files, for honesty: it also unpacks zlib streams and then models their contents better than augur does. It is smaller on guava.jar (624,847), attention.pdf (336,592), f1040.pdf (46,670), demo.docx (634,912), requests.whl (31,901) and pride.epub (17,482,977). augur is smaller on samba.tar.gz (2,629,128 vs 5,254,194) and silesia_xml.zip (2,411,288 vs 2,557,898), whose GNU gzip and Info-ZIP streams paq8px cannot reproduce.
 
 ### Lossless audio
 

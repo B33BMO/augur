@@ -245,15 +245,11 @@ const MINLEN_LONG: usize = 16;
 const CLIMIT: u16 = 15; // counter saturation: caps the slowest adaptation rate
 const LR: i32 = 15; // mixer learning rate (retuned for the two-layer mixer)
 const LR_SAMPLES: i32 = 8; // inside audio and image regions
+const ERR_LIMIT: i32 = 12; // mixer errors (of 4096) too small to train on
 const APM_RATE: i32 = 8; // SSE adaptation shift
 const APM_EDGE: i32 = 1; // closest an SSE cell may get to certainty, in 1/65536
 const NMIX: usize = 12; // layer-1 mixers, one per selector view
-/// Middle layer: remixes the layer-1 outputs and a few promoted inputs.
-const NMID: usize = 4;
-const NPROMO: usize = 3; // the two match models and the record model
-const MID_IN: usize = NMIX + NPROMO;
-/// The combining layer sees the middle layer and, skipping it, layer 1.
-const FIN_IN: usize = NMID + NMIX;
+
 /// log2(weight sets) for each layer-1 mixer: partial byte, previous byte,
 /// match-state x bit position, structure context.
 /// Mixer 2's selector packs a 4-bit match-length bucket, three oracle on-flags
@@ -951,7 +947,13 @@ impl<const N: usize> Mixer<N> {
     #[inline]
     fn update(&mut self, st: &[i32; N], out: i32, bit: u32, live: usize, lr: i32) {
         let sq = unsafe { *self.sqtab.get_unchecked((out.clamp(ST_MIN, ST_MAX) + 2048) as usize) };
-        let err = (((bit as i32) << 12) - sq) * lr;
+        let e0 = ((bit as i32) << 12) - sq;
+        // no training on errors this small: across many correlated inputs the
+        // tiny updates only accumulate noise in the weights (swept 8-32)
+        if e0.abs() < ERR_LIMIT {
+            return;
+        }
+        let err = e0 * lr;
         // SAFETY: sel was set by the matching mix() call; live <= N
         let w = unsafe { self.w.get_unchecked_mut(self.sel..self.sel + live) };
         for i in 0..live {
@@ -1239,13 +1241,7 @@ struct Predictor {
     mix1: Vec<Mixer<NIN>>,
     mix2: Mixer<NMIX>,
     m1out: [i32; NMIX],
-    mixm: Vec<Mixer<MID_IN>>,
-    mid_in: [i32; MID_IN],
-    mid_out: [i32; NMID],
-    mixf: Mixer<FIN_IN>,
-    fin_in: [i32; FIN_IN],
-    three: bool,
-    bits_seen: u64,
+
     // cached for update()
     st: [i32; NIN],
     mix2out: i32, // layer-2 stretched output — what the SSE chain refines
@@ -1366,13 +1362,7 @@ impl Predictor {
             mix1: MIX_CTX_BITS.iter().map(|&b| Mixer::new(b)).collect(),
             mix2: Mixer::new(8),
             m1out: [0; NMIX],
-            mixm: [8usize, 10, 10, 9].iter().map(|&b| Mixer::new(b)).collect(),
-            mid_in: [0; MID_IN],
-            mid_out: [0; NMID],
-            mixf: Mixer::new(8),
-            fin_in: [0; FIN_IN],
-            three: std::env::var_os("AUGUR_MIX3").is_some(),
-            bits_seen: 0,
+
             st: [0; NIN],
             mix2out: 0,
         };
@@ -1746,18 +1736,8 @@ impl Predictor {
             // beat 4-24 fixed and every decay schedule tried)
             (LR_SAMPLES, LR_SAMPLES)
         } else {
-            // TUNING: decaying rate, knobs AUGUR_LRD="hi,lo,k(Kbits)"
-            match std::env::var("AUGUR_LRD").ok() {
-                Some(v) => {
-                    let k: Vec<i64> = v.split(',').map(|x| x.parse().unwrap()).collect();
-                    let t = self.bits_seen as i64;
-                    let lr = (k[1] + (k[0] - k[1]) * k[2] * 1000 / (k[2] * 1000 + t)) as i32;
-                    (lr, lr)
-                }
-                None => (LR, LR),
-            }
+            (LR, LR)
         };
-        self.bits_seen += 1;
         if let Some(f) = self.front.as_deref_mut() {
             if f.active() {
                 f.inputs(self.c0, self.bitpos, &mut self.st[FRONT0..]);
@@ -1790,27 +1770,7 @@ impl Predictor {
         for j in 0..NMIX {
             self.m1out[j] = self.mix1[j].mix(&self.st, sel[j], self.live);
         }
-        if self.three {
-            self.mid_in[..NMIX].copy_from_slice(&self.m1out);
-            self.mid_in[NMIX] = self.st[ORA0];
-            self.mid_in[NMIX + 1] = self.st[ORA0 + 1];
-            self.mid_in[NMIX + 2] = self.st[ORA0 + NMATCH];
-            let m0 = &self.matches[0];
-            let msel = [
-                self.c0 as usize,
-                (last as usize) << 2 | (self.bitpos as usize >> 1),
-                (lenbucket(m0.len) as usize) << 6 | (self.rec_on as usize) << 5 | (m0.on as usize) << 4 | (self.bitpos as usize),
-                self.text.mixer_sel(self.bitpos) & 511,
-            ];
-            for j in 0..NMID {
-                self.mid_out[j] = self.mixm[j].mix(&self.mid_in, msel[j], MID_IN);
-            }
-            self.fin_in[..NMID].copy_from_slice(&self.mid_out);
-            self.fin_in[NMID..].copy_from_slice(&self.m1out);
-            self.mix2out = self.mixf.mix(&self.fin_in, self.c0 as usize, FIN_IN);
-        } else {
-            self.mix2out = self.mix2.mix(&self.m1out, self.c0 as usize, NMIX);
-        }
+        self.mix2out = self.mix2.mix(&self.m1out, self.c0 as usize, NMIX);
 
         // SSE chain: three calibrations of the mixed output, each blended 3:1
         // with its input so a cold APM can only nudge, never hijack.
@@ -1934,15 +1894,7 @@ impl Predictor {
             x.update(bit);
         }
 
-        if self.three {
-            self.mixf.update(&self.fin_in, self.mix2out, bit, FIN_IN, self.lr2);
-            for j in 0..NMID {
-                let out = self.mid_out[j];
-                self.mixm[j].update(&self.mid_in, out, bit, MID_IN, self.lr2);
-            }
-        } else {
-            self.mix2.update(&self.m1out, self.mix2out, bit, NMIX, self.lr2);
-        }
+        self.mix2.update(&self.m1out, self.mix2out, bit, NMIX, self.lr2);
         for j in 0..NMIX {
             let out = self.m1out[j];
             self.mix1[j].update(&self.st, out, bit, self.live, self.lr1);
